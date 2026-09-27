@@ -2,10 +2,11 @@
 
 A 16-turtle chunk quarry that mines in rings around a control chunk.
 
-This repo starts as a copy of the working straight-line quarry,
-[Quarry-CC-program](https://github.com/landonracer109/Quarry-CC-program) v8,
-and is being turned into the ring version. Until the ring code lands, the
-programs here behave exactly like v8 (shown as version R0 on the dashboard).
+It grew out of the working straight-line quarry,
+[Quarry-CC-program](https://github.com/landonracer109/Quarry-CC-program) v8
+(same network timing, service turtle and dashboard). R1 is the first ring
+version: it passes the simulator's full test set (normal runs, restarts,
+server crashes), but hasn't run in game yet.
 
 ## The plan
 
@@ -22,6 +23,23 @@ programs here behave exactly like v8 (shown as version R0 on the dashboard).
   and shows it on the dashboard.
 - GPS (4 host computers on the tower) so turtles can always find their way
   home, plus a RECALL button.
+
+## Setting up (from v8)
+
+1. **GPS**: 4 computers with wireless modems up on the tower, spread out
+   (not all at the same height or in one line). On each, run
+   `gps host <x> <y> <z>` with that computer's own coordinates (F3), in a
+   `startup` file so they come back after a restart. The turtles work
+   without GPS too, but then can't find their way after a crash.
+2. **Spot Loaders**: a stack in slot 16 of lane 0. Mining ring R needs
+   9R-2 of them at once (ring 2: 16, ring 3: 25, ring 7: 61; ring 1: none),
+   so one stack of 64 covers up to ring 7.
+3. Update everything from this repo (UPD on the dashboard, or `c update`).
+   The main computer asks how many rings to mine; SET changes it later.
+   The map of finished chunks is kept in `quarry.map` (START OVER in SET
+   clears it). Chunks are checked before they're mined, so already-mined
+   ones go quickly.
+4. Fluids: turtles move and dig through water and lava without harm.
 
 ## Programs
 

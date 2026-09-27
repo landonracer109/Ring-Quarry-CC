@@ -70,7 +70,7 @@ end
 local DEPLOY_PROTOCOL = "chunkdeploy"
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "R0"
+local VERSION = "R1"
 
 local REPO = "https://raw.githubusercontent.com/landonracer109/Ring-Quarry-CC/"
 local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
@@ -260,31 +260,57 @@ if OPTION == "update" then
 end
 
 -- The last settings are remembered and reused; you're only asked the
--- first time, after "c new", or after pressing C.
+-- first time, after "c new", or after pressing C (or SET on the monitor).
 local SETTINGS_FILE = "quarry.cfg"
-local CHUNK_SIZE = 16 -- blocks per lane per chunk (a Minecraft chunk)
--- quarry.cfg: (unused: length and depth, from older versions), chunks
-local saved = { 16, 0, 0 }
+local CHUNK_SIZE = 16 -- a Minecraft chunk
+-- quarry.cfg: how many rings to mine (up to and including that ring)
+local saved_rings = 2
 if fs.exists(SETTINGS_FILE) then
   local f = fs.open(SETTINGS_FILE, "r")
-  for i = 1, 3 do saved[i] = tonumber(f.readLine()) or saved[i] end
+  saved_rings = tonumber(f.readLine()) or saved_rings
   f.close()
 end
 
--- How many chunks have been mined completely, over all runs so far.
-local PROGRESS_FILE = "quarry.progress"
-local function read_progress()
-  if not fs.exists(PROGRESS_FILE) then return 0 end
-  local f = fs.open(PROGRESS_FILE, "r")
-  local n = tonumber(f.readLine())
-  f.close()
-  return n or 0
+-- Rings (the same code is in the miners' program) -----------------------------
+-- The quarry mines rings of chunks around the CONTROL chunk (this computer's
+-- tower, the service turtle), clockwise, starting with the spoke: the line
+-- of chunks straight north of it, where the miners' start spots are.
+-- Chunk (a, b) is a chunks east and b chunks north of the control chunk.
+-- d = the way the lanes run (0 north, 1 east, 2 south, 3 west).
+local function ring_order(r)
+  local list = { { a = 0, b = r, d = 0 } }
+  for a = 1, r do list[#list + 1] = { a = a, b = r, d = 1 } end
+  for b = r - 1, -r, -1 do list[#list + 1] = { a = r, b = b, d = 2 } end
+  for a = r - 1, -r, -1 do list[#list + 1] = { a = a, b = -r, d = 3 } end
+  for b = -r + 1, r do list[#list + 1] = { a = -r, b = b, d = 0 } end
+  for a = -r + 1, -1 do list[#list + 1] = { a = a, b = r, d = 1 } end
+  return list
 end
-local function write_progress(n)
-  local f = fs.open(PROGRESS_FILE, "w")
-  f.write(n .. "\n")
+
+local function ckey(a, b) return a .. "," .. b end
+local function ring_of(a, b) return math.max(math.abs(a), math.abs(b)) end
+
+-- Finished chunks, over all runs ("a,b" = true). A chunk counts as finished
+-- when every lane has checked or mined its lane in it.
+local MAP_FILE = "quarry.map"
+local mined = {}
+local function load_map()
+  mined = {}
+  if not fs.exists(MAP_FILE) then return end
+  local f = fs.open(MAP_FILE, "r")
+  while true do
+    local line = f.readLine()
+    if not line then break end
+    if line:match("^%-?%d+,%-?%d+$") then mined[line] = true end
+  end
   f.close()
 end
+local function save_map()
+  local f = fs.open(MAP_FILE, "w")
+  for k in pairs(mined) do f.writeLine(k) end
+  f.close()
+end
+load_map()
 
 local function ask(question, default)
   io.write(question .. " [" .. default .. "]: ")
@@ -321,24 +347,20 @@ if OPTION == "new" then clear_run() end
 local resumed = load_run()
 
 local ASK_FILE = ".ask_settings" -- written by the C key
-local length, depth, chunks
--- chunks mined in earlier runs, skipped by this one
-local skip = read_progress()
+local depth
+local chunks = saved_rings -- (rings to mine: "chunks" kept as the name)
 local ask_now = fs.exists(ASK_FILE) or OPTION == "new" or not fs.exists(SETTINGS_FILE)
 if resumed then
   -- (the turtles registered before the reboot are kept either way)
-  length, depth, chunks = resumed.length or CHUNK_SIZE, resumed.depth, resumed.chunks
-  skip = resumed.skip or 0
+  depth, chunks = resumed.depth, resumed.chunks or chunks
   run_seq = resumed.seq
 end
 if resumed and resumed.started then
   -- a run is in progress: carry on without asking anything
   if fs.exists(ASK_FILE) then fs.delete(ASK_FILE) end
-elseif not ask_now then
-  if not resumed then length, chunks = CHUNK_SIZE, saved[3] end
-else
+elseif ask_now then
   if fs.exists(ASK_FILE) then fs.delete(ASK_FILE) end
-  -- the questions are on the computer's own screen: say so on the monitor
+  -- the question is on the computer's own screen: say so on the monitor
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "monitor" then
       local m = peripheral.wrap(name)
@@ -346,7 +368,7 @@ else
       m.clear()
       m.setTextScale(1)
       m.setCursorPos(2, 2)
-      m.write("Answer the questions on the")
+      m.write("Answer the question on the")
       m.setCursorPos(2, 3)
       m.write("main computer's screen.")
     end
@@ -354,24 +376,30 @@ else
   parallel.waitForAny(function()
     term.clear()
     term.setCursorPos(1, 1)
-    print("=== Chunk Quarry Control ===")
+    print("=== Ring Quarry Control ===")
     print("(press ENTER to keep the value in brackets)")
-    chunks = ask("Chunks to mine (0 = until stopped)", saved[3])
-    local mined = ask("Chunks already mined, to drive past (0 = start over)", read_progress())
-    write_progress(math.max(0, math.floor(mined)))
+    chunks = math.max(1, math.floor(ask("Mine up to ring", saved_rings)))
   end, deploy_server, sender_loop) -- keep handing out programs while you type
-  length = CHUNK_SIZE
-  skip = read_progress()
-
   local f = fs.open(SETTINGS_FILE, "w")
-  f.write(length .. "\n0\n" .. chunks .. "\n")
+  f.write(chunks .. "\n")
   f.close()
 end
 
--- The last chunk this run mines (0 = until stopped).
-local function last_chunk_no()
-  return chunks == 0 and 0 or skip + chunks
+-- The plan: every chunk of rings 1 .. chunks, in order. Its index (seq) is
+-- how the miners know which chunk is which.
+local plan = {}
+local function build_plan()
+  plan = {}
+  for r = 1, chunks do
+    local order = ring_order(r)
+    for i, c in ipairs(order) do
+      plan[#plan + 1] = { a = c.a, b = c.b, d = c.d, ring = r, idx = i, count = #order }
+    end
+  end
 end
+build_plan()
+
+local function last_chunk_no() return #plan end
 
 -- depth = layers down to bedrock, as reported by the miners (nil until
 -- one has found it). Miners clear 3 layers per pass.
@@ -388,11 +416,15 @@ local stop_requested = false
 local finished = false   -- no more chunks: answer everything with "stop"
 local last_chunk = false -- lane 0 is out of loaders: end after this chunk
 local all_home = false
-local current_chunk = 1
+local current_chunk = 0 -- (the plan index the fleet is on; 0 = not yet)
+local loaders_out = {}   -- { a, b, d, ring } in the order they were placed
+local last_next          -- the last "next_chunk" message (re-sent to a lane that missed it)
+local arrived = {}       -- [lane] = true: left the finished ring (see ring changes)
 local service = { state = "not heard from yet" }
 local log_lines = {}
 local program_start = os.clock()
 local confirm_stop_until = 0
+local confirm_recall_until = 0
 
 -- Saves everything needed to carry on after a restart. Called after every
 -- change to the run.
@@ -402,7 +434,8 @@ local function save_run()
   for lane, m in pairs(miners) do lanes[lane] = { id = m.id, home = m.home } end
   local f = fs.open(RUN_FILES[run_seq % 2 + 1], "w")
   f.write(textutils.serialize({
-    seq = run_seq, length = length, depth = depth, chunks = chunks, skip = skip,
+    seq = run_seq, depth = depth, chunks = chunks,
+    loaders_out = loaders_out, last_next = last_next,
     started = started, elapsed = started_at and (os.clock() - started_at) or 0,
     current_chunk = current_chunk, stop_requested = stop_requested,
     finished = finished, last_chunk = last_chunk,
@@ -415,6 +448,7 @@ if resumed then
   started, current_chunk = resumed.started, resumed.current_chunk
   stop_requested, finished = resumed.stop_requested, resumed.finished
   last_chunk = resumed.last_chunk
+  loaders_out, last_next = resumed.loaders_out or {}, resumed.last_next
   if started then started_at = os.clock() - (resumed.elapsed or 0) end
   done, stopped = resumed.done or {}, resumed.stopped or {}
   for lane, l in pairs(resumed.lanes or {}) do
@@ -503,6 +537,13 @@ local function source_color(source)
   return colors.lightBlue
 end
 
+-- "Ring 2  chunk 5/16" (or how far the plan goes before a start)
+local function where_text()
+  local c = plan[current_chunk]
+  if c then return string.format("Ring %d  chunk %d/%d", c.ring, c.idx, c.count) end
+  return "Rings 1-" .. chunks
+end
+
 local function run_state()
   if all_home then return "DONE", colors.lightGray end
   if finished then return "HEADING HOME", colors.orange end
@@ -588,7 +629,8 @@ end
 local function lane_progress(lane)
   local m = miners[lane]
   if all_home or (done[lane] or 0) >= current_chunk then return 1 end
-  if m.chunk == current_chunk and m.pass and passes() then
+  local c = plan[current_chunk]
+  if c and m.chunk == ckey(c.a, c.b) and m.pass and passes() then
     return math.min((m.pass - 1) / passes(), 1)
   end
   return 0
@@ -644,6 +686,8 @@ local function find_monitor()
   end
 end
 
+local advance -- (with the fleet control code below)
+
 local function do_start()
   if started then return end
   if not next(miners) then
@@ -653,27 +697,28 @@ local function do_start()
   started = true
   started_at = os.clock()
   panel = nil -- (a settings panel left open closes)
-  skip = read_progress()
+  build_plan()
+  current_chunk, loaders_out, last_next, done, arrived = 0, {}, nil, {}, {}
   local lanes = sorted_lanes()
-  add_log("control", string.format("Started %d lanes: down to bedrock, %s.",
-    #lanes, chunks == 0 and "until stopped" or (chunks .. " chunks")))
-  if skip > 0 then
-    add_log("control", "Chunks 1-" .. skip .. " were mined before: driving past them.")
-  end
+  local n = 0
+  for k in pairs(mined) do n = n + 1 end
+  add_log("control", string.format("Started %d lanes: rings 1-%d, down to bedrock (%d chunks finished before).",
+    #lanes, chunks, n))
   for _, lane in ipairs(lanes) do
-    queue_send(miners[lane].id, {
-      cmd = "start", id = lane, length = length, depth = depth, chunks = last_chunk_no(),
-      chunk = current_chunk, skip = skip,
-    }, PROTOCOL)
+    queue_send(miners[lane].id, { cmd = "start", id = lane }, PROTOCOL)
     miners[lane].status = "starting"
     miners[lane].at_home = nil
     miners[lane].confirmed = nil
     miners[lane].stop_heard, miners[lane].stop_sent = nil, nil
   end
   save_run()
+  advance()
 end
 
 local tell_stop -- (defined with the fleet control code below)
+
+local recalled = false
+local do_recall -- (with the fleet control code below)
 
 local function do_stop()
   if not started or stop_requested or finished then return end
@@ -686,7 +731,7 @@ end
 -- The settings panel (SET): big text and big buttons at the bottom of the
 -- monitor, where you stand. The monitor switches to the largest text that
 -- fits it while it's open.
-local PANEL_W, PANEL_H = 40, 19
+local PANEL_W, PANEL_H = 40, 20
 local panel_scaled = false
 
 local function center(text, width)
@@ -749,8 +794,15 @@ local function draw_panel(t)
   end
   line({ { center("SETTINGS", PANEL_W), colors.yellow } })
   line({})
-  setting("Chunks to mine", panel.chunks == 0 and "no limit" or panel.chunks, "c", "0 = no limit")
-  setting("Already mined (driven past)", panel.mined, "m", "0 = start over at chunk 1")
+  setting("Mine up to ring", panel.chunks, "c", "ring 1 = the 8 chunks around the base")
+  line({ { " Finished chunks on the map: " .. panel.mined, colors.white } })
+  boxes({
+    { label = panel.reset and "MAP CLEARED" or (panel.confirm_reset and "SURE?" or "START OVER"),
+      w = 14, name = panel.confirm_reset and "reset2" or "reset",
+      bg = panel.confirm_reset and colors.orange or colors.gray },
+  })
+  line({ { " (start over: every chunk gets checked again)", colors.lightGray } })
+  line({})
   boxes({
     { label = "SAVE", w = 14, name = "save", bg = colors.green },
     { label = "", w = 4 },
@@ -780,7 +832,7 @@ local function draw_monitor()
   local state, state_color = run_state()
   local title = {
     { " QUARRY " .. VERSION .. " ", colors.white, colors.blue },
-    { string.format(" Chunk %d/%s  ", current_chunk, chunks == 0 and "inf" or tostring(last_chunk_no())), colors.white },
+    { " " .. where_text() .. "  ", colors.white },
     { state, state_color },
   }
   -- buttons on the right: UPD(ate), SET(tings), LOG(s), START / STOP
@@ -804,6 +856,14 @@ local function draw_monitor()
   end
   add(" LOG ", "logs", colors.lightGray)
   add(" ", nil, nil)
+  if started and not finished and not recalled then
+    if os.clock() < confirm_recall_until then
+      add(" RECALL? ", "confirm_recall", colors.orange)
+    else
+      add(" RECALL ", "recall", colors.purple)
+    end
+    add(" ", nil, nil)
+  end
   if not started then
     add(" START ", "start", colors.green)
   elseif not stop_requested and not finished then
@@ -827,7 +887,7 @@ local function draw_monitor()
 
   -- Settings and overall progress through the current chunk.
   local frac = chunk_progress()
-  local prefix = string.format(" Length %d  Depth %s   Chunk ", length, depth_text())
+  local prefix = string.format(" Depth %s   Chunk ", depth_text())
   local pieces = { { prefix, colors.lightGray } }
   add_bar(t, pieces, frac, math.max(10, w - #prefix - 6))
   table.insert(pieces, { string.format(" %3d%%", math.floor(frac * 100 + 0.5)), colors.white })
@@ -839,6 +899,25 @@ local function draw_monitor()
   local fixed = 6 + 7 + 8 + 6 + 8 + 6 + 5 + (wide and 12 or 0)
   local miner_ver = served_version("miner")
   local sw = math.max(10, w - fixed)
+  local mapw = (2 * chunks + 1) * 2 + 1
+  if w - mapw < 30 then mapw = 0 end
+  local cur = plan[current_chunk]
+  local map_top -- (set below the lane table)
+  -- the map's piece for screen row yy, or nil
+  local function map_at(yy)
+    if mapw == 0 or not map_top then return nil end
+    local b = chunks - (yy - map_top)
+    if b > chunks or b < -chunks then return nil end
+    local text = " "
+    for a = -chunks, chunks do
+      local ch = "."
+      if a == 0 and b == 0 then ch = "C"
+      elseif cur and cur.a == a and cur.b == b and started then ch = "@"
+      elseif mined[ckey(a, b)] then ch = "#" end
+      text = text .. ch .. " "
+    end
+    return { { text, colors.lightBlue } }
+  end
   row(t, y, { { pad(" LANE", 6) .. pad("STATUS", sw) .. pad("CHUNK", 7) .. pad("PASS", 8)
     .. (wide and pad("PROGRESS", 12) or "") .. pad("Y", 6) .. pad("FUEL", 8) .. pad("SEEN", 6) .. "VER", colors.gray } })
   y = y + 1
@@ -872,6 +951,7 @@ local function draw_monitor()
     y = y + 1
   end
   if y <= h then row(t, y, {}) y = y + 1 end
+  map_top = y
 
   -- Service turtle panel.
   -- (idle at home it says nothing, on purpose: only silence while busy is odd)
@@ -896,15 +976,15 @@ local function draw_monitor()
   }
   for _, pieces_row in ipairs(service_rows) do
     if y <= h then
-      row(t, y, pieces_row)
+      row(t, y, pieces_row, map_at(y))
       y = y + 1
     end
   end
-  if y <= h then row(t, y, {}) y = y + 1 end
+  if y <= h then row(t, y, {}, map_at(y)) y = y + 1 end
 
   -- Log: newest at the bottom, filling the rest of the screen.
   if y <= h then
-    row(t, y, { { " LOG ", colors.white, colors.gray }, { "  also saved to " .. LOG_FILE, colors.gray } })
+    row(t, y, { { " LOG ", colors.white, colors.gray }, { "  also saved to " .. LOG_FILE, colors.gray } }, map_at(y))
     y = y + 1
   end
   local rows = h - y + 1
@@ -916,9 +996,9 @@ local function draw_monitor()
         { " " .. pad(e.time, 8), colors.gray },
         { pad(e.source, 9), source_color(e.source) },
         { e.text, e.warn and colors.red or colors.white },
-      })
+      }, map_at(y))
     else
-      row(t, y, {})
+      row(t, y, {}, map_at(y))
     end
     y = y + 1
   end
@@ -932,8 +1012,7 @@ local function draw_terminal()
   local state, state_color = run_state()
   row(t, 1, {
     { VERSION .. " ", colors.lightBlue },
-    { string.format("L=%d D=%s chunk %d/%s ", length, depth_text(), current_chunk,
-      chunks == 0 and "inf" or tostring(last_chunk_no())), colors.white },
+    { string.format("D=%s %s ", depth_text(), where_text()), colors.white },
     { state, state_color },
   })
   local y = 2
@@ -993,6 +1072,22 @@ local function draw_all(force)
 end
 
 -- Fleet control ---------------------------------------------------------------
+-- Chunks the turtles may travel through: finished and loaded (ring 1 is
+-- always loaded; further out only while its loader is in).
+local function open_list()
+  local list = {}
+  for k in pairs(mined) do
+    local a, b = k:match("^(%-?%d+),(%-?%d+)$")
+    a, b = tonumber(a), tonumber(b)
+    local loaded = ring_of(a, b) <= 1
+    for _, t in ipairs(loaders_out) do
+      if t[1] == a and t[2] == b then loaded = true end
+    end
+    if loaded then list[#list + 1] = { a, b } end
+  end
+  return list
+end
+
 local function send(lane, msg)
   queue_send(miners[lane].id, msg, PROTOCOL)
 end
@@ -1000,12 +1095,27 @@ end
 -- Re-sent now and then (see maintenance_loop) until the lane says it's
 -- heading home: it may have been restarting when the first one came.
 function tell_stop(lane)
-  send(lane, { cmd = "stop", id = lane })
+  send(lane, { cmd = "stop", id = lane, open = open_list() })
   miners[lane].stop_sent = os.clock()
   if not stopped[lane] then
     stopped[lane] = true
     miners[lane].status = "stopped, going home"
     save_run()
+  end
+end
+
+-- RECALL: like STOP, but the lanes drop what they're doing and come home
+-- at once (lane 0 still takes the loaders back after).
+function do_recall()
+  if not started or finished or recalled then return end
+  recalled, stop_requested = true, true
+  add_log("control", "RECALL: every turtle comes home now.")
+  save_run()
+  for lane in pairs(miners) do
+    send(lane, { cmd = "recall", id = lane, open = open_list() })
+    stopped[lane] = true
+    miners[lane].stop_sent = os.clock()
+    miners[lane].status = "recalled, going home"
   end
 end
 
@@ -1033,8 +1143,9 @@ local function check_all_home()
   add_log("control", "All lanes are home. The next run starts with ENTER or START.")
   -- ready for the next run with the same settings
   started, started_at = false, nil
-  current_chunk = 1
-  skip = read_progress()
+  current_chunk = 0
+  loaders_out, last_next = {}, nil
+  recalled = false
   done, stopped = {}, {}
   stop_requested, finished, last_chunk, all_home = false, false, false, false
   for _, m in pairs(miners) do
@@ -1058,34 +1169,112 @@ local function nudge_if_outdated(sender, role, version, who)
   add_log("control", "Telling " .. who .. " to reboot into the newest version.")
 end
 
--- Called when a lane reports chunk_done: if everyone is done, either move
--- the fleet to the next chunk or finish.
-local function try_advance()
-  for lane in pairs(miners) do
-    if (done[lane] or 0) < current_chunk then return end
+-- Every chunk from ring 2 out needs a Spot Loader while the fleet works
+-- in it or goes through it. Lane 0 puts it in from the chunk next door.
+local function has_loader(a, b)
+  for _, t in ipairs(loaders_out) do
+    if t[1] == a and t[2] == b then return true end
   end
-  -- every lane has finished this chunk: remember it for the next run
-  if current_chunk > read_progress() then write_progress(current_chunk) end
-  if stop_requested or last_chunk or (chunks ~= 0 and current_chunk >= last_chunk_no()) then
-    finished = true
-    if stop_requested then
-      add_log("control", "Stopped after chunk " .. current_chunk .. ". Lanes are heading home.")
-    else
-      add_log("control", "Run complete: mined up to chunk " .. current_chunk .. ". Lanes are heading home.")
+  return false
+end
+
+-- Loaders needed to work on plan[j]: the spoke out to its ring, then its
+-- ring from the spoke round to it (the way the fleet came).
+local function loaders_for(j)
+  local c, list = plan[j], {}
+  for b = 2, c.ring do
+    if not has_loader(0, b) then list[#list + 1] = { 0, b, 0, b } end
+  end
+  if c.ring >= 2 then
+    local first = j - c.idx + 1
+    for k = first + 1, j do
+      local x = plan[k]
+      if not has_loader(x.a, x.b) then list[#list + 1] = { x.a, x.b, x.d, x.ring } end
     end
-    for lane in pairs(miners) do tell_stop(lane) end
-  else
-    add_log("control", "All lanes finished chunk " .. current_chunk
-      .. ". Moving to chunk " .. (current_chunk + 1) .. ".")
-    current_chunk = current_chunk + 1
-    -- one message every lane hears at once (they all set off together)
-    queue_send(nil, { cmd = "next_chunk", chunk = current_chunk }, PROTOCOL)
-    for lane in pairs(miners) do
-      miners[lane].status = "to chunk " .. current_chunk
-      miners[lane].pass = nil
+  end
+  return list
+end
+
+local function next_unfinished(after)
+  for j = after + 1, #plan do
+    if not mined[ckey(plan[j].a, plan[j].b)] then return j end
+  end
+end
+
+-- Sends the fleet to plan[j]. At a ring change lane 0 first takes the
+-- finished ring's loaders back (not the spoke's), once everyone else has
+-- left that ring.
+local function go_to_chunk(j)
+  local c = plan[j]
+  local prev = plan[current_chunk]
+  local l0 = { place = {}, collect = {} }
+  local open_before = open_list()
+  if prev and c.ring > prev.ring then
+    local keep = {}
+    for i = #loaders_out, 1, -1 do
+      local t = loaders_out[i]
+      if t[4] == prev.ring and not (t[1] == 0 and t[2] > 0) then -- (not the spoke's)
+        l0.collect[#l0.collect + 1] = t
+      end
     end
+    for _, t in ipairs(loaders_out) do
+      if not (t[4] == prev.ring and not (t[1] == 0 and t[2] > 0)) then keep[#keep + 1] = t end
+    end
+    if #l0.collect > 0 then
+      l0.collect_open = open_before
+      l0.wait_clear = true
+      loaders_out = keep
+    end
+  end
+  for _, t in ipairs(loaders_for(j)) do
+    l0.place[#l0.place + 1] = t
+    loaders_out[#loaders_out + 1] = t
+  end
+  l0.place_open = open_list()
+  current_chunk = j
+  arrived = {}
+  last_next = { cmd = "next_chunk", seq = j, ring = c.ring, idx = c.idx, count = c.count,
+    a = c.a, b = c.b, d = c.d, open = open_list(), travel_open = open_before, l0 = l0 }
+  -- one message every lane hears at once (they all set off together)
+  queue_send(nil, last_next, PROTOCOL)
+  local others = false
+  for lane in pairs(miners) do if lane ~= 0 then others = true end end
+  if l0.wait_clear and not others and miners[0] then
+    send(0, { cmd = "clear", id = 0, seq = j })
+  end
+  add_log("control", string.format("Ring %d, chunk %d/%d (%d,%d): off we go.", c.ring, c.idx, c.count, c.a, c.b))
+  for lane in pairs(miners) do
+    miners[lane].status = "to chunk " .. ckey(c.a, c.b)
+    miners[lane].pass = nil
   end
   save_run()
+end
+
+-- Called when a lane reports its part done: if everyone has, the chunk is
+-- finished; then the next one, or the run is over.
+function advance()
+  local c = plan[current_chunk]
+  if c then
+    for lane in pairs(miners) do
+      if (done[lane] or 0) < current_chunk then return end
+    end
+    mined[ckey(c.a, c.b)] = true
+    save_map()
+    add_log("control", string.format("Chunk (%d,%d) finished (ring %d, %d/%d).", c.a, c.b, c.ring, c.idx, c.count))
+  end
+  local j = next_unfinished(current_chunk)
+  if stop_requested or last_chunk or not j then
+    finished = true
+    if stop_requested then
+      add_log("control", "Stopped. Lanes are heading home.")
+    else
+      add_log("control", "Run complete: rings 1-" .. chunks .. " are mined. Lanes are heading home.")
+    end
+    for lane in pairs(miners) do tell_stop(lane) end
+    save_run()
+    return
+  end
+  go_to_chunk(j)
 end
 
 -- Lane 0 may take the loaders back once every other lane is home and the
@@ -1131,15 +1320,13 @@ local function handle(sender, msg)
       -- program): join the run at the current chunk
       add_log("control", "Lane " .. lane .. " registered late: joining the run.")
       miners[lane] = { id = sender, status = "starting", seen = os.clock() }
-      send(lane, { cmd = "start", id = lane, length = length, depth = depth,
-        chunks = last_chunk_no(), chunk = current_chunk, skip = skip })
+      send(lane, { cmd = "start", id = lane })
       save_run()
     elseif m and m.id == sender and not finished and not stop_requested and not stopped[lane] then
       -- it missed the start message, or was reset with "here": (re)join
       -- the run at the current chunk
       m.home, m.at_home, m.confirmed = nil, nil, nil
-      send(lane, { cmd = "start", id = lane, length = length, depth = depth,
-        chunks = last_chunk_no(), chunk = current_chunk, skip = skip })
+      send(lane, { cmd = "start", id = lane })
     elseif m and m.id == sender and not (m.home and m.confirmed) then
       -- A turtle only says hello when it has no run left: this one is on
       -- its start spot. (Its "finished" may have been lost in a restart.)
@@ -1162,31 +1349,45 @@ local function handle(sender, msg)
         add_log("control", "Everyone else is home: lane " .. lane .. " is picking up the loaders.")
       end
       m.status = "collecting loaders"
-      send(lane, { cmd = "collect", id = lane })
+      local list = {}
+      for i = #loaders_out, 1, -1 do list[#list + 1] = loaders_out[i] end
+      send(lane, { cmd = "collect", id = lane, list = list, open = open_list() })
     else
       m.status = "waiting for " .. waiting[1]
     end
   elseif msg.cmd == "chunk_done" then
-    if msg.no_next_loader and not last_chunk then
-      -- lane 0 couldn't load the next chunk, so nobody may drive into it:
-      -- let everyone finish this chunk, then end the run
-      last_chunk = true
-      add_log("control", "No loader for the next chunk, so this chunk is the last one.")
-    end
-    if (done[lane] or 0) < msg.chunk then
-      done[lane] = msg.chunk
+    local seq = tonumber(msg.seq) or 0
+    if (done[lane] or 0) < seq then
+      done[lane] = seq
       save_run()
     end
-    m.chunk = msg.chunk
     if finished or stop_requested then
       tell_stop(lane)
-    elseif msg.chunk < current_chunk then
-      -- behind: it missed the next_chunk message, or a server crash put
-      -- it back. Send it on to the chunk after the one it just finished.
-      send(lane, { cmd = "next_chunk", id = lane, chunk = msg.chunk + 1 })
-    else
-      m.status = "chunk " .. msg.chunk .. " done, waiting"
-      try_advance()
+    elseif seq < current_chunk and last_next then
+      -- behind (it missed the message, or was restarted): send it again
+      local copy = {}
+      for k, v in pairs(last_next) do copy[k] = v end
+      copy.id = lane
+      send(lane, copy)
+    elseif current_chunk > 0 then
+      m.status = "chunk " .. (plan[current_chunk] and ckey(plan[current_chunk].a, plan[current_chunk].b) or "?")
+        .. " done, waiting"
+      advance()
+    end
+  elseif msg.cmd == "arrived" then
+    -- at a ring change: once everyone else is out of the finished ring,
+    -- lane 0 may take its loaders back
+    if tonumber(msg.seq) == current_chunk then
+      -- (lane 0 sends it too, now and then, while it waits: we answer again)
+      if lane ~= 0 then arrived[lane] = true end
+      local all = true
+      for other in pairs(miners) do
+        if other ~= 0 and not arrived[other] then all = false end
+      end
+      if all and miners[0] then
+        send(0, { cmd = "clear", id = 0, seq = current_chunk })
+        add_log("control", "Everyone is out of the finished ring: lane 0 is taking its loaders back.")
+      end
     end
   end
 end
@@ -1225,6 +1426,14 @@ local function handle_status(sender, msg)
       if type(info) == "table" then
         m.chunk, m.pass, m.y, m.fuel = info.chunk, info.pass, info.y, info.fuel
         m.trash = info.trash
+        local c = plan[current_chunk]
+        if msg.id ~= 0 and c and type(info.e) == "number" and type(info.n) == "number"
+            and math.floor(info.e / CHUNK_SIZE) == c.a
+            and math.floor(info.n / CHUNK_SIZE) + 1 == c.b
+            and last_next and type(last_next.l0) == "table" and last_next.l0.wait_clear
+            and not arrived[msg.id] then
+          handle(sender, { cmd = "arrived", id = msg.id, seq = current_chunk })
+        end
         if type(info.depth) == "number" and info.depth ~= depth then
           depth = info.depth
           add_log("control", "Bedrock found: mining " .. depth .. " layers deep.")
@@ -1272,8 +1481,10 @@ local function handle_status(sender, msg)
         registered = msg.hello.registered })
     end
     if type(msg.chunk_done) == "table" then
-      handle(sender, { cmd = "chunk_done", id = msg.id, chunk = msg.chunk_done.chunk,
-        no_next_loader = msg.chunk_done.no_next_loader })
+      handle(sender, { cmd = "chunk_done", id = msg.id, seq = msg.chunk_done.seq })
+    end
+    if type(msg.arrived) == "table" then
+      handle(sender, { cmd = "arrived", id = msg.id, seq = msg.arrived.seq })
     end
     if msg.may_collect then handle(sender, { cmd = "may_collect", id = msg.id }) end
     check_all_home()
@@ -1389,15 +1600,18 @@ end
 
 -- SAVE on the settings panel (same as answering the questions after C).
 local function save_settings()
-  chunks = math.max(0, panel.chunks)
-  write_progress(math.max(0, panel.mined))
-  skip = read_progress()
+  chunks = math.max(1, panel.chunks)
+  if panel.reset then
+    mined = {}
+    save_map()
+    add_log("control", "Map cleared: every chunk gets checked again.")
+  end
   local f = fs.open(SETTINGS_FILE, "w")
-  f.write(length .. "\n0\n" .. chunks .. "\n")
+  f.write(chunks .. "\n")
   f.close()
+  build_plan()
   save_run()
-  add_log("control", string.format("Settings saved: %s, %d mined before (driven past).",
-    chunks == 0 and "until stopped" or (chunks .. " chunks"), skip))
+  add_log("control", "Settings saved: mine up to ring " .. chunks .. ".")
 end
 
 local function touched(name)
@@ -1409,6 +1623,11 @@ local function touched(name)
   elseif name == "confirm_stop" then
     confirm_stop_until = 0
     do_stop()
+  elseif name == "recall" then
+    confirm_recall_until = os.clock() + 5
+  elseif name == "confirm_recall" then
+    confirm_recall_until = 0
+    do_recall()
   elseif name == "update" then
     confirm_update_until = os.clock() + 5
   elseif name == "confirm_update" then
@@ -1420,7 +1639,9 @@ local function touched(name)
     if panel then
       panel = nil
     else
-      panel = { chunks = chunks, mined = read_progress() }
+      local n = 0
+      for _ in pairs(mined) do n = n + 1 end
+      panel = { chunks = chunks, mined = n }
     end
   elseif name == "cancel" then
     panel = nil
@@ -1428,9 +1649,10 @@ local function touched(name)
     save_settings()
     panel = nil
   elseif panel then
+    if name == "reset" then panel.confirm_reset = true
+    elseif name == "reset2" then panel.reset, panel.confirm_reset, panel.mined = true, nil, 0 end
     local key, amount = name:match("^([cm])([%-%+]%d+)$")
-    if key == "c" then panel.chunks = math.max(0, panel.chunks + tonumber(amount)) end
-    if key == "m" then panel.mined = math.max(0, panel.mined + tonumber(amount)) end
+    if key == "c" then panel.chunks = math.max(1, panel.chunks + tonumber(amount)) end
   end
 end
 
@@ -1480,13 +1702,12 @@ if update_staged() and not (resumed and started) then
   apply_update()
 end
 if resumed and started then
-  add_log("control", "Restarted: resuming the run at chunk " .. current_chunk .. ".")
+  add_log("control", "Restarted: resuming the run (" .. where_text() .. ").")
   check_all_home()
 elseif resumed then
   add_log("control", "Restarted: kept the lanes registered before the restart.")
 else
-  add_log("control", string.format("Controller ready (down to bedrock, %s, %d mined before). Waiting for lanes.",
-    chunks == 0 and "until stopped" or (chunks .. " chunks"), read_progress()))
+  add_log("control", "Controller ready (rings 1-" .. chunks .. ", down to bedrock). Waiting for lanes.")
 end
 if not mon then add_log("control", "No monitor found - attach an Advanced Monitor for the dashboard.") end
 term.clear()
