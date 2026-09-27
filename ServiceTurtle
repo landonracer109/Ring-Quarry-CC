@@ -1,0 +1,1179 @@
+-- quarry_service (service turtle) -- ComputerCraft 1.63
+-- Run on ONE dedicated turtle. It drives along the home row behind the
+-- mining turtles (they come home when they need it), pulling out their
+-- mined blocks and handing them fuel, so the miners never need chests.
+--
+-- SETUP (stand behind the miners, looking the way they face):
+--   * HOME spot: one block BEHIND lane 0's start and one block to its LEFT.
+--     Place the service turtle there, facing the same way as the miners.
+--   * OUTPUT chest directly ABOVE the home spot (mined blocks go here;
+--     pipe them out of it to bigger storage).
+--   * FUEL chest directly BELOW the home spot. Put ONLY fuel in it, and
+--     only one kind. Best: COAL BLOCKS (800 fuel each, ten times coal). Keep some fuel in it: after a restart
+--     the turtle finds home by the chests above and below it.
+--   * REQUIRED: any solid block directly IN FRONT of the home spot. Every
+--     time it's home the turtle looks at it to check which way it faces.
+--   * Clear the row the service turtle drives along (home spot + the 16
+--     blocks to its right) -- it will dig that row if needed, but never
+--     digs inside the lanes, so it can't destroy a mining turtle.
+--   * Wireless modem.
+--   * Run: s   (leave it running; Ctrl+T to stop when done)
+--          s install   also run automatically every time it boots
+--          s here      "I'm on my home spot" -- only needed if it says LOST
+--   * Home must stay chunk-loaded (control computer + both chests).
+--
+-- INVENTORY: slots 1-12 = mined blocks, slots 13-16 = fuel for the miners
+-- (filled automatically from the fuel chest). It only goes home when it
+-- has no room for the next load, runs low on coal, or has been idle for
+-- 30 seconds.
+--
+-- SURVIVES SERVER RESTARTS: it saves its position before every move and
+-- turn. After a restart its fuel level tells whether the last move
+-- happened (every move costs exactly 1 fuel). It only ever faces forward
+-- or right (driving backward instead of turning around), so if a restart
+-- comes mid-turn there are just two possibilities: it tries each by
+-- driving home without digging and checking for the fuel chest underneath.
+
+local PROTOCOL = "chunkquarry"          -- (only the control computer's "who")
+local SERVICE_PROTOCOL = "chunkservice" -- miners <-> service turtle
+local STATUS_PROTOCOL = "chunkstatus"   -- status updates for the dashboard
+local DEPLOY_PROTOCOL = "chunkdeploy"   -- program updates from the main computer
+
+local OPTION = ({ ... })[1]
+local PROGRAM = shell and shell.getRunningProgram() or "quarry_service"
+if OPTION == "install" then
+  local f = fs.open("startup", "w")
+  f.write('shell.run("' .. PROGRAM .. '")\n')
+  f.close()
+  print("Done: this turtle now runs '" .. PROGRAM .. "' every time it boots.")
+  print("Reboot (hold Ctrl+R) to start it. To undo: delete startup")
+  return
+end
+
+-- Shown on the dashboard, so you can tell whether everything got updated.
+-- c, m and s carry the same number; it goes up with every change.
+local VERSION = "R0"
+
+-- Our program's checksum, so the main computer can spot a turtle running an
+-- old version between runs. Only when we were started by the boot loader
+-- (set up with "disk/join"), which fetches the new version when we reboot.
+local MY_VERSION
+if fs.exists("boot") and fs.exists(PROGRAM) then
+  local h = fs.open(PROGRAM, "r")
+  local text = h.readAll()
+  h.close()
+  local sum = 0
+  for i = 1, #text do sum = (sum * 31 + text:byte(i)) % 2147483647 end
+  MY_VERSION = sum
+end
+
+local STATE_FILES = { ".service_state_a", ".service_state_b" }
+if OPTION == "here" then
+  for _, name in ipairs(STATE_FILES) do fs.delete(name) end
+  fs.delete(".service_log_a")
+  fs.delete(".service_log_b")
+  fs.delete(".quarry_away") -- left over from older versions
+  print("OK: starting fresh from the home spot.")
+end
+
+local function open_modem()
+  for _, side in ipairs(rs.getSides()) do
+    if peripheral.getType(side) == "modem" then
+      rednet.open(side)
+      return true
+    end
+  end
+  return false
+end
+
+if not open_modem() then
+  error("No modem attached! Attach a wireless modem and rerun.")
+end
+
+-- Config --------------------------------------------------------------------
+-- Inventory: slots 1-12 carry mined blocks, slots 13-16 carry fuel for the
+-- miners (4 stacks of coal blocks = about 50 top-ups between refills).
+local CARGO_SLOTS = 12
+local FIRST_FUEL_SLOT = 13
+local SELF_FUEL_TARGET = 1000  -- we only drive along the home row
+local SELF_FUEL_MIN = 200      -- below this (and no fuel in the chest) we wait at home
+local MAX_HANDOVER = 64        -- fuel items per visit, at most
+local IDLE_HOME_AFTER = 30  -- seconds with nothing to do before going home
+local UNBREAKABLE_TRIES = 5
+
+local P -- our position and fuel notes (see Position below)
+
+local function fuel_stock()
+  local n = 0
+  for slot = FIRST_FUEL_SLOT, 16 do n = n + turtle.getItemCount(slot) end
+  return n
+end
+
+-- Fuel one item gives: coal 80, coal block 800, blaze rod 120. Measured
+-- every time we burn one ourselves (see burn_one_fuel).
+local function fuel_per_item()
+  return (P and P.per_item) or 80
+end
+
+-- Fuel items that fit into a miner with `fuel`, whose tank holds `limit`
+-- (it reports both): miners are filled right up.
+local function items_for(fuel, limit)
+  local room = (limit or 20000) - fuel
+  return math.max(0, math.min(MAX_HANDOVER, math.floor(room / fuel_per_item())))
+end
+
+-- when idle, go home to refill below this
+local function low_stock()
+  return fuel_stock() < 2 * MAX_HANDOVER
+end
+
+local function fuel_level()
+  local level = turtle.getFuelLevel()
+  if level == "unlimited" then return math.huge end
+  return level
+end
+
+-- Network -------------------------------------------------------------------
+-- The server allows no more than ONE rednet message per second from each
+-- computer, so every message goes through net_send / net_broadcast: at
+-- most one per SEND_GAP seconds.
+-- A turtle throws away rednet messages that arrive while it is moving or
+-- digging. So a listener runs beside the program (see the bottom of this
+-- file) and files every message in the inbox: nothing is lost.
+local SEND_GAP = 1
+local last_send = os.clock() -- (as if we had just sent: a message may have gone out just before a reboot)
+local inbox = {}
+local controller_id -- the control computer (the miners tell us which it is)
+
+local function listener()
+  while true do
+    local ev = { os.pullEvent("rednet_message") }
+    if ev[4] == PROTOCOL and type(ev[3]) == "table" and ev[3].cmd == "upload_log" then
+      os.queueEvent("upload_log") -- (see uploader)
+    elseif ev[4] == SERVICE_PROTOCOL or ev[4] == DEPLOY_PROTOCOL or ev[4] == PROTOCOL then
+      table.insert(inbox, ev)
+      if #inbox > 50 then table.remove(inbox, 1) end
+    end
+  end
+end
+
+-- (no yield between the last check and last_send: two senders can't both pass)
+local function wait_send_gap()
+  while os.clock() < last_send + SEND_GAP do
+    sleep(last_send + SEND_GAP - os.clock())
+  end
+  last_send = os.clock()
+end
+
+local function net_send(id, msg, proto)
+  wait_send_gap()
+  rednet.send(id, msg, proto)
+end
+
+local function net_broadcast(msg, proto)
+  wait_send_gap()
+  rednet.broadcast(msg, proto)
+end
+
+local function take(proto)
+  for i, ev in ipairs(inbox) do
+    if proto == nil or ev[4] == proto then
+      table.remove(inbox, i)
+      return ev
+    end
+  end
+end
+
+-- Like rednet.receive(proto, timeout) (no timeout = wait as long as it
+-- takes), but reads the inbox.
+local function net_receive(proto, timeout)
+  local ev = take(proto)
+  if ev then return ev[2], ev[3], ev[4] end
+  if timeout and timeout <= 0 then return nil end
+  local timer = timeout and os.startTimer(timeout)
+  while true do
+    local e = { os.pullEvent() }
+    if e[1] == "rednet_message" then
+      ev = take(proto) -- (the listener, running first, has filed it)
+      if ev then return ev[2], ev[3], ev[4] end
+    elseif timer and e[1] == "timer" and e[2] == timer then
+      return nil
+    end
+  end
+end
+
+-- Dashboard -----------------------------------------------------------------
+-- Every computer in the quarry has its own second in a CYCLE-second round,
+-- timed by the in-game clock (the same on every computer); ours is second
+-- 0. So the dashboard updates of the whole quarry arrive one at a time.
+-- We only send when something changed, plus a sign of life now and then
+-- while there's work; nothing at all while idle. Only "updating" goes out
+-- at once (we reboot next).
+local queue = {}   -- FIFO of service jobs (see Requests below)
+local status = { state = "starting up", lane = false }
+local CYCLE = 20
+local MY_SLOT = 0
+local KEEPALIVE = 240
+local URGENT = { ["updating"] = true }
+local last_report = -math.huge
+local last_active = -math.huge -- when we last had a job
+local pending_texts -- log lines not sent yet (nil = nothing new)
+local sent_on_row
+
+local function on_row()
+  -- on the home row, out of every lane: lane 0 may take the loaders back
+  return P ~= nil and P.sz == 0 and not P.moving and not P.turn_to
+    and not P.recovering
+end
+
+local function world_seconds()
+  return (os.day() * 24 + os.time()) * 50 -- (an in-game hour is 50 s)
+end
+
+local function send_report()
+  local texts = pending_texts or {}
+  pending_texts = nil
+  last_report = os.clock()
+  sent_on_row = on_row()
+  local msg = {
+    cmd = "service", state = status.state, lane = status.lane, texts = texts,
+    queue = #queue, fuel = turtle.getFuelLevel(),
+    stock = fuel_stock(), version = MY_VERSION, ver = VERSION, on_row = sent_on_row,
+  }
+  if controller_id then
+    net_send(controller_id, msg, STATUS_PROTOCOL)
+  else
+    net_broadcast(msg, STATUS_PROTOCOL)
+  end
+end
+
+-- Runs beside the program: wakes up once a round, in our own second.
+local function status_sender()
+  local last_w
+  while true do
+    -- idle with nothing to say: sleep until there is something
+    while not pending_texts and #queue == 0 and os.clock() - last_active >= 600 do
+      os.pullEvent("status_pending")
+    end    local w = world_seconds()
+    local wait
+    if w == last_w then
+      -- the clock stands still (daylight cycle off): our own timing,
+      -- still one slot each (computers booted together have similar clocks)
+      wait = (MY_SLOT - os.clock()) % CYCLE
+    else
+      wait = (MY_SLOT - w) % CYCLE
+    end
+    if wait < 0.5 then wait = wait + CYCLE end -- (just sent in this slot)
+    last_w = w
+    sleep(wait)
+    local busy = #queue > 0 or os.clock() - last_active < 600
+    if pending_texts or (busy and os.clock() - last_report >= KEEPALIVE) then
+      send_report()
+    end
+  end
+end
+
+-- force: send right away
+local function flush_report(force)
+  if force then send_report() end
+end
+
+-- Our own log, for finding out what went wrong: everything we report plus
+-- details the dashboard doesn't show. .service_debug_a is the current file,
+-- .service_debug_b the one before (a new one at every boot and every 300 lines).
+-- To look at it:  edit .service_debug_a      To share it:  pastebin put .service_debug_a
+local DEBUG_FILES = { ".service_debug_a", ".service_debug_b" }
+local debug_lines = 0
+local function rotate_debug()
+  if fs.exists(DEBUG_FILES[1]) then
+    if fs.exists(DEBUG_FILES[2]) then fs.delete(DEBUG_FILES[2]) end
+    fs.move(DEBUG_FILES[1], DEBUG_FILES[2])
+  end
+  debug_lines = 0
+end
+rotate_debug()
+
+local function debug(text)
+  if debug_lines >= 300 then rotate_debug() end
+  local where = P and string.format("x%s z%s f%s q%d", tostring(P.sx), tostring(P.sz),
+    tostring(turtle.getFuelLevel()), #queue) or "-"
+  local line = string.format("%d %s %s %s", os.day(), textutils.formatTime(os.time(), true), where, text)
+  local h = fs.open(DEBUG_FILES[1], "a")
+  if h then
+    h.writeLine(line)
+    h.close()
+    debug_lines = debug_lines + 1
+  end
+end
+
+-- Prints `text` (if given) and passes our current state on to the
+-- dashboard. `lane` is the lane we're busy with, or false for none
+-- (nil = unchanged).
+local function report(state, text, lane)
+  if text or (state and state ~= status.state) then
+    debug((state and ("[" .. state .. "] ") or "") .. (text or ""))
+  end
+  if state then status.state = state end
+  if lane ~= nil then status.lane = lane end
+  if text then print(text) end
+  pending_texts = pending_texts or {}
+  if text then table.insert(pending_texts, text) end
+  os.queueEvent("status_pending") -- (wakes status_sender if it's asleep)
+  if state and URGENT[state] then send_report() end
+end
+
+-- Position (saved) ------------------------------------------------------------
+-- P.sx = blocks to the right of home (along the row of lanes)
+-- P.sz = blocks forward from home (into the tunnels)
+-- P.facing: 0 = tunnel direction, 1 = right, 2 = back, 3 = left
+-- P.moving   = a forward move was about to happen (fuel tells if it did)
+-- P.turn_to  = a turn to this facing was about to happen
+-- P.recovering = we were finding our facing after a restart
+-- Saved to two files in turn, so a restart mid-write never loses both.
+P = { sx = 0, sz = 0, facing = 0 }
+local save_seq = 0
+
+-- SERVER CRASHES: a crash puts the world back to its last autosave (up to
+-- ~45 s ago), but our files keep their newer contents. So every save is
+-- also logged, and after a restart our fuel level (1 per move) tells which
+-- logged moment the world went back to (see rewind below).
+local JOURNAL_FILES = { ".service_log_a", ".service_log_b" }
+local JOURNAL_MAX = 300
+local POS_FIELDS = { "seq", "sx", "sz", "facing", "moving", "turn_to", "fuel", "wt" }
+local journal_file, journal_lines, journal_core
+
+local function journal()
+  if type(P.fuel) ~= "number" then return end
+  if not journal_file or journal_lines >= JOURNAL_MAX then
+    journal_file = (journal_file == JOURNAL_FILES[1]) and JOURNAL_FILES[2] or JOURNAL_FILES[1]
+    local h = fs.open(journal_file, "w")
+    h.close()
+    journal_lines, journal_core = 0, nil -- each file starts with a full copy
+  end
+  local keep = {}
+  for _, k in ipairs(POS_FIELDS) do keep[k] = P[k]; P[k] = nil end
+  local core = textutils.serialize(P)
+  for _, k in ipairs(POS_FIELDS) do P[k] = keep[k] end
+  local line
+  if core ~= journal_core then
+    journal_core = core
+    line = "S " .. textutils.serialize(P):gsub("\n", " ")
+  else
+    line = "P " .. P.seq .. " " .. P.sx .. " " .. P.sz .. " " .. P.facing .. " "
+      .. (P.moving or "-") .. " " .. (P.turn_to or "-") .. " " .. P.fuel .. " " .. (P.wt or -1)
+  end
+  local h = fs.open(journal_file, "a")
+  h.writeLine(line)
+  h.close()
+  journal_lines = journal_lines + 1
+end
+
+local function clear_journal()
+  for _, name in ipairs(JOURNAL_FILES) do fs.delete(name) end
+  journal_file = nil
+end
+
+-- Every logged state, oldest first.
+local function read_journal()
+  local states = {}
+  for _, name in ipairs(JOURNAL_FILES) do
+    if fs.exists(name) then
+      local h = fs.open(name, "r")
+      local cur
+      while true do
+        local line = h.readLine()
+        if not line then break end
+        local kind, rest = line:sub(1, 1), line:sub(3)
+        if kind == "S" then
+          local ok, t = pcall(textutils.unserialize, rest)
+          if ok and type(t) == "table" and type(t.seq) == "number" then
+            cur = t
+            table.insert(states, t)
+          end
+        elseif kind == "P" and cur then
+          local seq, sx, sz, facing, mv, tt, fuel, wt =
+            rest:match("^(%-?%d+) (%-?%d+) (%-?%d+) (%d) (%S+) (%S+) (%-?%d+) ?(%-?%d*)$")
+          if seq then
+            local t = {}
+            for k, v in pairs(cur) do t[k] = v end
+            t.seq, t.sx, t.sz, t.facing = tonumber(seq), tonumber(sx), tonumber(sz), tonumber(facing)
+            t.moving = (mv ~= "-") and mv or nil
+            t.turn_to = (tt ~= "-") and tonumber(tt) or nil
+            t.fuel = tonumber(fuel)
+            t.wt = tonumber(wt)
+            cur = t
+            table.insert(states, t)
+          end
+        end
+      end
+      h.close()
+    end
+  end
+  table.sort(states, function(a, b) return a.seq < b.seq end)
+  return states
+end
+
+local function save()
+  save_seq = save_seq + 1
+  P.seq = save_seq
+  P.fuel = turtle.getFuelLevel()
+  -- the in-game clock: saved with the world, so after a server crash it's
+  -- behind this (see the startup code)
+  P.wt = math.floor(world_seconds())
+  local f = fs.open(STATE_FILES[save_seq % 2 + 1], "w")
+  f.write(textutils.serialize(P))
+  f.close()
+  journal()
+end
+
+local function load_state()
+  local best
+  for _, name in ipairs(STATE_FILES) do
+    if fs.exists(name) then
+      local f = fs.open(name, "r")
+      local text = f.readAll()
+      f.close()
+      local ok, t = pcall(textutils.unserialize, text)
+      if ok and type(t) == "table" and type(t.seq) == "number"
+          and (not best or t.seq > best.seq) then
+        best = t
+      end
+    end
+  end
+  return best
+end
+
+-- While finding our facing after a restart, every turn and step is also
+-- recorded here, so each guess can be replayed from the same start.
+local recording
+
+local DX = { [0] = 0, 1, 0, -1 }
+local DZ = { [0] = 1, 0, -1, 0 }
+
+-- dir = 1 for a step forward, -1 for a step backward
+local function track_step(dir)
+  P.sx = P.sx + DX[P.facing] * dir
+  P.sz = P.sz + DZ[P.facing] * dir
+end
+
+-- Movement ------------------------------------------------------------------
+-- We only ever face two ways: forward (0, into the lanes) and right (1,
+-- along the home row). Going the other way we drive backward instead of
+-- turning around, so the only turns are single quarter turns at a lane
+-- entrance -- never on the home spot, where a restart mid-turn couldn't be
+-- told apart.
+
+-- One quarter turn, saved before and after: a restart in between leaves
+-- P.turn_to set, meaning "facing is P.facing or P.turn_to".
+local function quarter_turn(right)
+  local to = (P.facing + (right and 1 or 3)) % 4
+  P.turn_to = to
+  save()
+  if right then turtle.turnRight() else turtle.turnLeft() end
+  P.facing = to
+  P.turn_to = nil
+  save()
+  if recording then table.insert(recording, right and "R" or "L") end
+end
+
+local function face(dir)
+  local diff = (dir - P.facing) % 4
+  if diff == 1 then
+    quarter_turn(true)
+  elseif diff == 2 then
+    quarter_turn(true)
+    quarter_turn(true)
+  elseif diff == 3 then
+    quarter_turn(false)
+  end
+end
+
+-- One step forward (or backward), saved before it happens: after a restart
+-- our fuel level tells whether it did (every move costs exactly 1 fuel).
+-- Digs only going forward along the home row, where no mining turtle ever
+-- goes. In the lanes it waits instead, because the only solid thing there
+-- could be a turtle -- and turtles CAN dig turtles. Never attacks: CC 1.63
+-- can't tell a mob from a player, so it waits for it to move. While finding
+-- our facing after a restart it never digs and gives up quickly.
+local function step(backward, allow_dig)
+  local move = backward and turtle.back or turtle.forward
+  local failed_digs, waited, warned = 0, 0, false
+  while true do
+    P.moving = backward and "b" or "f"
+    save()
+    local moved = move()
+    P.moving = nil
+    if moved then break end
+    if turtle.getFuelLevel() == 0 then
+      report("OUT OF FUEL", "Out of fuel!")
+      return false
+    end
+    waited = waited + 1
+    if recording then
+      if waited >= 5 then return false end -- a wrong guess runs into walls
+    elseif not backward and turtle.detect() then
+      if allow_dig then
+        if turtle.dig() then
+          failed_digs = 0
+        else
+          failed_digs = failed_digs + 1
+          if failed_digs >= UNBREAKABLE_TRIES then return false end
+        end
+      else
+        if waited == 1 then report("blocked in a lane", "Blocked inside a lane, waiting...") end
+        if waited >= 30 then return false end
+      end
+    else
+      -- a mob or player in front, or anything behind us (we can't see back)
+      if not warned then
+        report("blocked", "Something is in my way. Waiting for it to move...")
+        warned = true
+      end
+      if backward and waited >= 60 then return false end
+    end
+    sleep(1)
+  end
+  track_step(backward and -1 or 1)
+  if recording then table.insert(recording, backward and "B" or "F") end
+  return true
+end
+
+-- Along the home row, always facing right: forward = right, backward = left.
+local function go_to_x(target)
+  if P.sx == target then return true end
+  face(1)
+  while P.sx < target do if not step(false, true) then return false end end
+  while P.sx > target do if not step(true) then return false end end
+  return true
+end
+
+-- In and out of a lane, always facing forward: back out backward.
+local function go_to_z(target)
+  if P.sz == target then return true end
+  face(0)
+  while P.sz < target do if not step(false, false) then return false end end
+  while P.sz > target do if not step(true) then return false end end
+  return true
+end
+
+-- Lane changes only happen on the home row (sz = 0), one block behind the
+-- miners' start line; depth moves only happen inside a lane's own tunnel.
+local function go_to(x, z)
+  return go_to_z(0) and go_to_x(x) and go_to_z(z)
+end
+
+-- Restart recovery ------------------------------------------------------------
+-- True if we're on the home spot: the output chest above us and the fuel
+-- chest below (the only place where sucking from below gets anything --
+-- recovery never takes us above a miner). What we pull out goes back.
+-- If the fuel chest is empty, the block in front of home tells instead.
+local function on_fuel_chest()
+  if not turtle.detectUp() or not turtle.detectDown() then return false end
+  local before = {}
+  for i = 1, 16 do before[i] = turtle.getItemCount(i) end
+  local got = turtle.suckDown()
+  for i = 1, 16 do -- (it may not land in the selected slot)
+    local gained = turtle.getItemCount(i) - before[i]
+    if gained > 0 then
+      turtle.select(i)
+      turtle.dropDown(gained)
+    end
+  end
+  turtle.select(1)
+  if got then return true end
+  -- Home, facing along the row: ahead is the clear row, and facing forward
+  -- is the block in front of home. (Turning on the home spot is safe: that
+  -- block tells the two facings apart after a restart.)
+  if not P.front_solid or turtle.detect() then return false end
+  face(0)
+  local marker = turtle.detect()
+  face(1)
+  return marker
+end
+
+-- We know where we are but not which way we face (the server stopped in
+-- the middle of a turn at a lane entrance, so we face forward or right).
+-- Try each: drive home without digging and check for the chests. We try
+-- "facing right" first: if that's wrong, backing up "along the row" really
+-- takes us backward, behind the row and away from the lanes, never above a
+-- miner. Every move is recorded, so after a wrong guess we can work out
+-- where we really are under the next one.
+local function find_facing(candidates)
+  P.recovering = true
+  save()
+  local start_x, start_z = P.sx, P.sz
+  recording = {}
+  for _, guess in ipairs(candidates) do
+    -- where we are now if we were facing `guess` at the start
+    P.sx, P.sz, P.facing = start_x, start_z, guess
+    for _, op in ipairs(recording) do
+      if op == "R" then P.facing = (P.facing + 1) % 4
+      elseif op == "L" then P.facing = (P.facing + 3) % 4
+      else track_step(op == "F" and 1 or -1) end
+    end
+    if go_to(0, 0) and on_fuel_chest() then
+      recording = nil
+      P.recovering = nil
+      save()
+      return true
+    end
+  end
+  recording = nil
+  return false
+end
+
+-- Inventory -----------------------------------------------------------------
+local function free_cargo_slots()
+  local n = 0
+  for i = 1, CARGO_SLOTS do
+    if turtle.getItemCount(i) == 0 then n = n + 1 end
+  end
+  return n
+end
+
+local function cargo_empty()
+  return free_cargo_slots() == CARGO_SLOTS
+end
+
+-- Fills the fuel slots (13-16) from the fuel chest below.
+local function top_up_fuel()
+  for slot = FIRST_FUEL_SLOT, 16 do
+    turtle.select(slot)
+    while turtle.getItemCount(slot) < 64 do
+      local before = turtle.getItemCount(slot)
+      if not turtle.suckDown() then break end
+      -- anything that spilled into the cargo slots goes back in the chest
+      for i = 1, CARGO_SLOTS do
+        if turtle.getItemCount(i) > 0 then
+          turtle.select(i)
+          turtle.dropDown()
+        end
+      end
+      turtle.select(slot)
+      if turtle.getItemCount(slot) == before then break end
+    end
+  end
+  turtle.select(1)
+end
+
+-- Burns ONE fuel item from the stock (never a whole stack, so there's
+-- always some left to deliver).
+local fuel_measured = false -- fuel per item measured since this boot
+
+-- A restart in the middle of burning leaves our fuel above our notes: this
+-- tells it apart from a server crash (see the startup code).
+-- Until this boot's first burn we don't know what the fuel is (the chest
+-- may have gone from coal to coal blocks): then any amount is fine.
+-- The stock is noted too: the inventory goes back with the world in a
+-- crash, so fewer items means we really burned them.
+local function start_burn()
+  P.burning = { per = fuel_measured and P.per_item or nil, stock = fuel_stock() }
+  save()
+end
+local function burn_one_fuel()
+  for slot = 16, FIRST_FUEL_SLOT, -1 do
+    if turtle.getItemCount(slot) > 0 then
+      turtle.select(slot)
+      local before = turtle.getFuelLevel()
+      local ok = turtle.refuel(1)
+      local gain = turtle.getFuelLevel() - before
+      if ok and gain > 0 then P.per_item = gain end
+      turtle.select(1)
+      return ok
+    end
+  end
+  return false
+end
+
+-- Hands `count` fuel items to the turtle in front of us (only if there is
+-- something in front of us: never onto the ground).
+local function hand_over_fuel(count)
+  if not turtle.detect() then return end
+  for slot = 16, FIRST_FUEL_SLOT, -1 do
+    if count <= 0 then break end
+    local n = math.min(count, turtle.getItemCount(slot))
+    if n > 0 then
+      turtle.select(slot)
+      if turtle.drop(n) then count = count - n end
+    end
+  end
+  turtle.select(1)
+end
+
+-- Goes home, empties cargo into the output chest, refuels itself and
+-- refills the coal stock.
+local chest_empty = false -- told the dashboard the fuel chest is empty
+local stay_lost -- (defined with the startup code below)
+local function restock()
+  report("restocking at home", nil, false)
+  while not go_to(0, 0) do
+    if fuel_level() == 0 then
+      -- stranded with an empty tank: burn anything we have, even the last
+      -- item we were keeping for a miner
+      start_burn()
+      local burned = burn_one_fuel()
+      P.burning = nil
+      save() -- fuel changed: the saved fuel level must match again
+      if burned then
+      else
+        report("OUT OF FUEL", "Out of fuel away from home! Put fuel in my slot 13.")
+        sleep(10)
+      end
+    else
+      report("can't get home", "Can't get home -- something is in the way. Retrying...")
+      sleep(5)
+    end
+  end
+
+  -- Check which way we face against the block in front of home: solid
+  -- ahead = facing forward, open = facing along the row. Our notes can be
+  -- wrong if we were picked up and put back, and a wrong facing would send
+  -- us digging off in the wrong direction.
+  if P.front_solid then
+    local actual = turtle.detect() and 0 or 1
+    if actual ~= P.facing then
+      report(nil, "My notes said I faced " .. (P.facing == 0 and "forward" or "along the row")
+        .. ", but I don't: corrected.")
+      P.facing = actual
+      save()
+    end
+  end
+
+  -- the output chest sits on top of the home spot: if there's nothing
+  -- above us, we're not where we think we are -- never drop things there
+  if not turtle.detectUp() then
+    stay_lost("No output chest above me, so I'm not really on my home spot.")
+  end
+  while not cargo_empty() do
+    for i = 1, CARGO_SLOTS do
+      if turtle.getItemCount(i) > 0 then
+        turtle.select(i)
+        turtle.dropUp()
+      end
+    end
+    if not cargo_empty() then
+      report("OUTPUT CHEST FULL", "Output chest is full! Empty it...")
+      sleep(10)
+    end
+  end
+
+  -- Never leave home without a full enough tank of our own: if the fuel
+  -- chest has run dry and we're low, wait here until it's refilled (never
+  -- go out on our last scraps and get stranded). With our own tank fine we
+  -- carry on unloading miners, just without fuel to hand out.
+  local warned = false
+  while true do
+    top_up_fuel()
+    start_burn()
+    -- once per boot, burn one item to learn what the fuel chest holds
+    -- (the fuel may have been changed, e.g. from coal to coal blocks)
+    if not fuel_measured and fuel_stock() > 1 and burn_one_fuel() then
+      fuel_measured = true
+      start_burn() -- (now whole items of it)
+    end
+    while fuel_level() < SELF_FUEL_TARGET and fuel_stock() > 0 do
+      if not burn_one_fuel() then
+        report("BAD FUEL", "The fuel slots (13-16) hold something that isn't fuel! Only put fuel in the fuel chest.")
+        break
+      end
+    end
+    P.burning = nil
+    save() -- fuel changed: the saved fuel level must match again
+    top_up_fuel()
+    -- full enough, or the chest is empty but we still have plenty for the
+    -- row (a trip along it is at most ~40 moves)
+    if fuel_level() >= SELF_FUEL_TARGET
+        or (fuel_stock() == 0 and fuel_level() >= SELF_FUEL_MIN) then
+      break
+    end
+    if not warned then
+      report("FUEL CHEST EMPTY", "Fuel chest is empty and I'm low myself! Waiting at home until it's refilled...")
+      warned = true
+    end
+    sleep(10)
+  end
+  if fuel_stock() == 0 then
+    if not chest_empty then
+      report("FUEL CHEST EMPTY", "Fuel chest is empty: still unloading miners, but no fuel for them until it's refilled.")
+      chest_empty = true
+    end
+  elseif chest_empty or warned then
+    chest_empty = false
+    report("restocking at home", "Fuel chest refilled.")
+  end
+
+  turtle.select(1)
+end
+
+-- Requests ------------------------------------------------------------------
+-- (queue is declared with the dashboard code above)
+local queued = {}  -- [lane] = request key while waiting in the queue
+local served = {}  -- [lane] = key of the last request we completed
+local current_key  -- key of the job in progress
+
+local function request_key(msg)
+  return tostring(msg.session) .. "#" .. tostring(msg.seq)
+end
+
+local function reply(to, cmd, job)
+  net_send(to, {
+    cmd = cmd, id = job.id, session = job.session, seq = job.seq,
+  }, SERVICE_PROTOCOL)
+end
+
+-- Handles a request whenever one arrives, even in the middle of another
+-- job, so requests aren't lost while we're busy.
+local function handle_message(sender, msg)
+  if type(msg) ~= "table" or msg.cmd ~= "service_request"
+      or type(msg.id) ~= "number" then
+    return
+  end
+  if type(msg.controller) == "number" then controller_id = msg.controller end
+  local key = request_key(msg)
+  if served[msg.id] == key then
+    reply(sender, "serviced", msg) -- already done; it just missed our reply
+    return
+  end
+  if queued[msg.id] ~= key and current_key ~= key then
+    queued[msg.id] = key
+    table.insert(queue, {
+      id = msg.id, session = msg.session, seq = msg.seq,
+      z = msg.z, fuel = msg.fuel, limit = msg.limit, stacks = msg.stacks,
+      sender = sender, key = key,
+    })
+    print("Queued lane " .. msg.id)
+    debug("Queued lane " .. msg.id .. ": " .. tostring(msg.stacks) .. " stacks, fuel "
+      .. tostring(msg.fuel))
+    report()
+  end
+  reply(sender, "ack", msg)
+end
+
+local drain_requests -- (defined below)
+
+local function serve(job)
+  last_active = os.clock()
+  drain_requests()
+  local trip = 2 * (job.id + 1 + job.z) + 20
+  -- ("unlimited" fuel comes through as a string: nothing to hand over)
+  local handover = type(job.fuel) == "number" and items_for(job.fuel, job.limit) or 0
+  local needs_fuel = handover > 0
+  -- the miner tells us how many slots of blocks it will hand over
+  local space_needed = math.min(job.stacks or CARGO_SLOTS, CARGO_SLOTS)
+  -- only go home when we must: no room for this load, not enough coal
+  -- to hand over, or not enough fuel for the trip ourselves
+  if free_cargo_slots() < space_needed
+      or (needs_fuel and fuel_stock() < handover)
+      or fuel_level() < trip then
+    restock()
+  end
+  -- (the fuel chest may be empty: hand over what we have, maybe nothing)
+  handover = math.min(handover, fuel_stock())
+  if space_needed == 0 and handover == 0 then
+    -- only wanted fuel and we have none: nothing to go there for (it asks
+    -- again, and we'll have fuel once the chest is refilled)
+    return false
+  end
+
+  report("going to lane " .. job.id, "Servicing lane " .. job.id, job.id)
+  -- lane N is N+1 blocks right of home; parking at sz = job.z puts us
+  -- directly behind a miner waiting at its chunk entrance
+  if not go_to(job.id + 1, job.z) then
+    report("path blocked", "Path to lane " .. job.id .. " blocked, will retry.")
+    return false
+  end
+  face(0)
+
+  -- The miner must actually be in front of us (on its start spot). If it
+  -- isn't, don't pretend to service it: it would go back to work with
+  -- nothing. It asks again later.
+  if not turtle.detect() then
+    report("idle", "Lane " .. job.id .. " isn't on its start spot, skipping for now.", false)
+    return false
+  end
+
+  report("unloading lane " .. job.id)
+  local stacks = job.stacks or 0
+  debug("Lane " .. job.id .. ": pulling " .. stacks .. " stacks (" .. free_cargo_slots()
+    .. " free slots here), handing over " .. handover .. " fuel items")
+
+  -- Pull exactly that many stacks out of the miner. Its cargo slots come
+  -- before lane 0's chunk loaders (slot 16), and each stack lands in one of
+  -- our empty cargo slots, so we never take the loaders.
+  turtle.select(1)
+  for _ = 1, math.min(stacks, free_cargo_slots()) do
+    if not turtle.suck() then break end
+  end
+
+  if handover > 0 then hand_over_fuel(handover) end
+
+  served[job.id] = job.key
+  reply(job.sender, "serviced", job)
+  drain_requests()
+  return true
+end
+
+-- Answers everything that came in while we were busy (so the miners get
+-- their "ack" and don't need to ask again).
+function drain_requests()
+  while true do
+    local sender, msg = net_receive(SERVICE_PROTOCOL, 0)
+    if not sender then return end
+    handle_message(sender, msg)
+  end
+end
+
+-- Keeps telling the dashboard (the control computer may still be booting
+-- after a restart), until someone sorts us out by hand.
+function stay_lost(text)
+  print("Put me back on my home spot (above the fuel chest, facing")
+  print("the same way as the miners), then run:  " .. PROGRAM .. " here")
+  while true do
+    report("LOST - move home", text)
+    sleep(60)
+  end
+end
+
+-- After a server crash: find the logged moment the world went back to (the
+-- one whose fuel matches ours now) and carry on from there. Turns cost no
+-- fuel, so if we turned around then, which way we face is checked after.
+-- Returns true if found.
+-- now_wt (the in-game clock now): skip saves made later than that.
+local function rewind(now_fuel, now_wt)
+  local states = read_journal()
+  for i = #states, 1, -1 do
+    local st = states[i]
+    local pick, facings
+    local future = now_wt and st.wt and st.wt > now_wt + 3
+    if future then
+      -- (made after the moment the world went back to)
+    elseif st.fuel == now_fuel then
+      local j = i
+      while j > 1 and states[j - 1].fuel == now_fuel do j = j - 1 end
+      pick = states[j]
+      facings = {}
+      for k = j, i do
+        facings[states[k].facing] = true
+        if states[k].turn_to then facings[states[k].turn_to] = true end
+      end
+      pick.moving = nil -- (a move saved at this fuel level didn't happen)
+    elseif st.moving and st.fuel - 1 == now_fuel then
+      pick = st -- crashed just after this move
+      facings = { [st.facing] = true }
+    end
+    if pick then
+      local newest = states[#states].seq
+      P = pick
+      if P.moving then track_step(P.moving == "b" and -1 or 1) end
+      P.moving = nil
+      P.turn_to = nil
+      local n = 0
+      for _ in pairs(facings) do n = n + 1 end
+      if n > 1 then
+        -- we may or may not have turned since: sorted out below, like a
+        -- restart in the middle of a turn
+        P.turn_to = (P.facing == 0) and 1 or 0
+      end
+      save_seq = newest
+      clear_journal() -- that future never happened: start a fresh log
+      report(nil, "Server crash: went back " .. (#states - i) .. " saves to match the world.")
+      return true
+    end
+  end
+  return false
+end
+
+-- Uploads text to a paste site (no account needed) and returns its web
+-- address, or nil and why not. (pastebin's old API no longer works.)
+local function upload(text)
+  if not http then return nil, "HTTP is turned off on this server" end
+  local r = http.post("https://paste.rs/", text)
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url end
+  end
+  r = http.post("https://dpaste.com/api/v2/",
+    "expiry_days=30&content=" .. textutils.urlEncode(text))
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url .. ".txt" end
+  end
+  return nil, "paste.rs and dpaste.com both refused (blocked by the server?)"
+end
+-- Runs beside the program: when the main computer asks (L key), uploads
+-- our log files (older one first) and reports the web address.
+local function uploader()
+  while true do
+    os.pullEvent("upload_log")
+    local text = ""
+    for i = 2, 1, -1 do
+      if fs.exists(DEBUG_FILES[i]) then
+        local h = fs.open(DEBUG_FILES[i], "r")
+        text = text .. "== " .. DEBUG_FILES[i] .. "\n" .. (h.readAll() or "") .. "\n"
+        h.close()
+      end
+    end
+    local url, why = upload(text)
+    if url then
+      report(nil, "Log uploaded: " .. url)
+    else
+      report(nil, "Couldn't upload my log: " .. tostring(why))
+    end
+  end
+end
+
+-- Startup -------------------------------------------------------------------
+local function main()
+report("starting up", "Service turtle starting up...")
+local saved = load_state()
+if saved then
+  P = saved
+  save_seq = P.seq
+  if P.recovering then
+    stay_lost("I was restarted while finding my way home and don't know where I am.")
+  end
+  -- Do our notes match the world? Every move costs exactly 1 fuel. And the
+  -- in-game clock going back means a server crash for sure, even when our
+  -- fuel happens to match. (If nothing in the log fits, someone set the
+  -- time back: carry on.)
+  local now_fuel = turtle.getFuelLevel()
+  local now_wt = math.floor(world_seconds())
+  if type(P.wt) == "number" and now_wt < P.wt - 3 and type(now_fuel) == "number"
+      and rewind(now_fuel, now_wt) then
+    if P.recovering then
+      stay_lost("I was restarted while finding my way home and don't know where I am.")
+    end
+  elseif type(now_fuel) ~= "number" or type(P.fuel) ~= "number" then
+    if P.moving then stay_lost("Restarted mid-move with unlimited fuel.") end
+  elseif P.moving and now_fuel == P.fuel - 1 then
+    track_step(P.moving == "b" and -1 or 1) -- the last step happened
+  elseif P.burning and now_fuel > P.fuel and (function()
+      local b = P.burning
+      if not b.stock then -- (notes from an older version)
+        return not b.per or (now_fuel - P.fuel) % b.per == 0
+      end
+      local used = b.stock - fuel_stock()
+      if b.per then return used >= 1 and now_fuel - P.fuel == used * b.per end
+      return used == 1
+    end)() then
+    -- restarted while burning fuel: our position is right
+    P.burning = nil
+  elseif now_fuel ~= P.fuel then
+    -- the world is behind our notes: a server crash
+    if not rewind(now_fuel) then
+      stay_lost("Restarted and my fuel doesn't match my notes.")
+    end
+    if P.recovering then
+      stay_lost("I was restarted while finding my way home and don't know where I am.")
+    end
+  end
+  -- A turn costs no fuel, so a server crash can undo one without our fuel
+  -- telling us: if we turned since our last move, check which way we face.
+  if not P.turn_to and type(now_fuel) == "number" then
+    local states = read_journal()
+    local facings, n = {}, 0
+    for i = #states, 1, -1 do
+      if states[i].fuel ~= now_fuel then break end
+      facings[states[i].facing] = true
+      if states[i].turn_to then facings[states[i].turn_to] = true end
+    end
+    for _ in pairs(facings) do n = n + 1 end
+    if n > 1 then P.turn_to = (P.facing == 0) and 1 or 0 end
+  end
+  P.moving = nil
+  save()
+  if P.turn_to and P.sx == 0 and P.sz == 0 then
+    -- The only turn ever made on the home spot is the very first one, from
+    -- facing forward to facing along the row (which is always clear). If
+    -- the block in front of home was solid, looking ahead tells them apart.
+    if P.front_solid then
+      P.facing = turtle.detect() and 0 or 1
+      P.turn_to = nil
+      save()
+    else
+      stay_lost("Restarted during my very first turn, so I don't know which way I face.")
+    end
+  elseif P.turn_to then
+    -- stopped mid-turn: we face forward or right; try "right" first
+    local candidates = { 1, 0 }
+    P.turn_to = nil
+    report("finding my way home", "Restarted mid-turn: working out which way I'm facing...")
+    if not find_facing(candidates) then
+      stay_lost("Couldn't find my way home after the restart.")
+    end
+    report(nil, "Found my way home.")
+  elseif P.sx ~= 0 or P.sz ~= 0 then
+    report(nil, "Restarted away from home: going back.")
+  end
+end
+if not saved then
+  -- fresh start on the home spot, facing forward: the block in front of
+  -- home is how we check our facing from now on
+  while not turtle.detect() do
+    report("NO BLOCK IN FRONT", "Put any solid block directly in front of my home spot (I face it: the same way as the miners).")
+    sleep(10)
+  end
+  P.front_solid = true
+end
+save()
+restock()
+report("idle at home", "Ready. Waiting for requests...", false)
+
+-- Main ----------------------------------------------------------------------
+local idle_since
+while true do
+  if #queue > 0 then
+    idle_since = nil
+    local job = table.remove(queue, 1)
+    queued[job.id] = nil
+    current_key = job.key
+    serve(job) -- if this fails, the miner re-sends and we try again
+    current_key = nil
+  else
+    -- Never wait inside a lane: a miner driving home could get stuck behind
+    -- us. The home row is ours alone, so wait there.
+    if P.sz ~= 0 then
+      report("waiting on the home row", nil, false)
+      go_to_z(0)
+      report()
+    end
+    -- After a while with nothing to do, go home to empty out and refill.
+    idle_since = idle_since or os.clock()
+    local at_home = P.sx == 0 and P.sz == 0
+    if os.clock() - idle_since >= IDLE_HOME_AFTER
+        and (not at_home or not cargo_empty() or low_stock()) then
+      restock()
+      print("Ready. Waiting for requests...")
+      report("idle at home", nil, false)
+      idle_since = os.clock()
+    end
+    -- wait for a message; wake up only to go home after being idle a while
+    local wake
+    if os.clock() - idle_since < IDLE_HOME_AFTER then
+      wake = idle_since + IDLE_HOME_AFTER - os.clock() + 0.1
+    end
+    local sender, msg, protocol = net_receive(nil, wake)
+    if protocol == SERVICE_PROTOCOL then
+      handle_message(sender, msg)
+    elseif protocol == PROTOCOL and type(msg) == "table" and msg.cmd == "who" then
+      -- the control computer was restarted: tell it where we are
+      controller_id = sender
+      report()
+    elseif protocol == DEPLOY_PROTOCOL and type(msg) == "table"
+        and msg.cmd == "update_reboot" and #queue == 0 then
+      -- the main computer only sends this between runs
+      restock()
+      report("updating", "Rebooting to install an update.", false)
+      os.reboot()
+    end
+    -- when we've reached / left the home row (lane 0 waits for that before
+    -- taking the loaders back)
+    if on_row() ~= sent_on_row then report() end
+  end
+end
+end -- main
+
+-- (the listener goes first, so a message is filed before main looks)
+parallel.waitForAny(listener, main, status_sender, uploader)

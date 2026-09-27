@@ -1,0 +1,1512 @@
+-- quarry_control (control computer) -- ComputerCraft 1.63
+-- Runs on a Computer (NOT a turtle) with a wireless modem attached.
+-- Registers the mining turtles, starts them, and moves the whole fleet to
+-- the next chunk once every turtle has finished the current one.
+--
+-- DASHBOARD: attach an Advanced Monitor (touching the computer, or through
+-- a wired modem) to see every lane, the service turtle and a live log.
+-- Suggested size: 6 wide x 5 tall; bigger is fine, the text size adapts.
+-- The log is also saved to the file "quarry.log" on this computer.
+--
+-- Start order: service turtle, then all miners, then this.
+-- Controls (keyboard or monitor touch):
+--   ENTER / touch START  = start mining once all turtles are registered
+--   S     / touch STOP   = stop (touch STOP twice to confirm); turtles
+--                          finish their current pass and go home
+--   Q                    = quit once every lane has been told to stop
+--
+-- "c install" makes this computer run the controller on every boot. The
+-- number of chunks is remembered: just press ENTER to reuse it. Chunks are
+-- 16 blocks long, and the miners always dig down to bedrock and report how
+-- deep that is. At the end of every run lane 0 picks the loaders back up,
+-- once this computer has seen everyone else get home.
+--
+-- Each run carries on where the last one left off: chunks mined in earlier
+-- runs (remembered in "quarry.progress") are driven through, not mined.
+-- Press C to change that number (0 = start over from chunk 1).
+--
+-- SURVIVES SERVER RESTARTS: the run (settings, lanes, current chunk, who is
+-- done) is saved to disk, and after a restart the controller carries on
+-- where it left off without asking anything. "c new" throws away a saved
+-- run and starts over.
+--
+-- PROGRAM SERVER: turtles set up with "disk/join" get their programs from
+-- this computer at every boot. U (or "c update") downloads the newest
+-- versions from GitHub with the "get" program; they're installed as soon
+-- as no run is in progress, and every turtle is rebooted onto them.
+-- C = change the settings (between runs).
+
+local PROTOCOL = "chunkquarry"        -- control computer <-> miners
+local STATUS_PROTOCOL = "chunkstatus" -- status updates for the dashboard
+local LOG_FILE = "quarry.log"
+local MAX_LOG = 200                   -- log lines kept in memory
+
+local opened = false
+for _, side in ipairs(rs.getSides()) do
+  if peripheral.getType(side) == "modem" then
+    rednet.open(side)
+    opened = true
+  end
+end
+if not opened then
+  error("No modem attached! Attach a wireless modem and rerun.")
+end
+
+local PROGRAM = shell and shell.getRunningProgram() or "quarry_control"
+local OPTION = ({ ... })[1]
+if OPTION == "install" then
+  local f = fs.open("startup", "w")
+  f.write('shell.run("' .. PROGRAM .. '")\n')
+  f.close()
+  print("Done: this computer now runs '" .. PROGRAM .. "' every time it boots.")
+  print("Reboot (hold Ctrl+R) to start it. To undo: delete startup")
+  return
+end
+
+-- Programs for the turtles ---------------------------------------------------
+-- live/ holds the programs the turtles run. An update is downloaded into
+-- staged/ and only moved into live/ between runs, so a turtle that restarts
+-- in the middle of a run always gets the version the run started with.
+local DEPLOY_PROTOCOL = "chunkdeploy"
+-- Shown on the dashboard, so you can tell whether everything got updated.
+-- c, m and s carry the same number; it goes up with every change.
+local VERSION = "R0"
+
+local REPO = "https://raw.githubusercontent.com/landonracer109/Ring-Quarry-CC/"
+local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
+local ROLE_PROGRAM = { miner = "m", service = "s" }
+
+local function read_file(p)
+  if not fs.exists(p) then return nil end
+  local h = fs.open(p, "r")
+  local text = h.readAll()
+  h.close()
+  return text
+end
+
+-- The same checksum the turtles use to tell whether their copy is current.
+local function checksum(text)
+  local h = 0
+  for i = 1, #text do h = (h * 31 + text:byte(i)) % 2147483647 end
+  return h
+end
+
+-- first time: take the turtle programs from the floppy, if it's in the drive
+for _, name in ipairs({ "m", "s" }) do
+  if not fs.exists("live/" .. name) and fs.exists("disk/" .. name) then
+    if not fs.exists("live") then fs.makeDir("live") end
+    fs.copy("disk/" .. name, "live/" .. name)
+  end
+end
+
+local live_cache = {}
+local function live_program(name)
+  local text = read_file("live/" .. name)
+  if not text then return nil end
+  local c = live_cache[name]
+  if not c or c.text ~= text then
+    c = { text = text, sum = checksum(text) }
+    live_cache[name] = c
+  end
+  return c
+end
+
+-- The VERSION line of a program we'd hand out (nil: not downloaded yet).
+local function served_version(role)
+  local p = live_program(ROLE_PROGRAM[role])
+  return p and p.text:match('local VERSION = "([^"]+)"') or VERSION
+end
+
+-- Network -------------------------------------------------------------------
+-- The server allows no more than ONE rednet message per second from each
+-- computer. Everything we send goes into this queue, and sender_loop sends
+-- one per SEND_GAP seconds. A newer message of the same kind to the same
+-- computer replaces one still waiting (only the latest matters).
+local SEND_GAP = 1
+local out_queue = {}
+local last_net_send = os.clock() -- (a message may have gone out just before a reboot)
+
+-- Waits until we may send again (shared by everything that sends).
+local function net_gap_wait()
+  while os.clock() - last_net_send < SEND_GAP do
+    sleep(math.max(0, last_net_send + SEND_GAP - os.clock()))
+  end
+  last_net_send = os.clock()
+end
+
+-- id = nil: broadcast
+local function queue_send(id, msg, proto)
+  for _, q in ipairs(out_queue) do
+    if q.id == id and q.proto == proto and q.msg.cmd == msg.cmd and q.msg.role == msg.role then
+      q.msg = msg
+      return
+    end
+  end
+  table.insert(out_queue, { id = id, msg = msg, proto = proto })
+  os.queueEvent("outbox")
+end
+
+local function sender_loop()
+  while true do
+    local q = table.remove(out_queue, 1)
+    if q then
+      net_gap_wait()
+      if q.id then
+        rednet.send(q.id, q.msg, q.proto)
+      else
+        rednet.broadcast(q.msg, q.proto)
+      end
+    else
+      os.pullEvent("outbox") -- (sleeps until queue_send has something)
+    end
+  end
+end
+
+local deploy_log = function() end -- becomes the dashboard log once it exists
+local missing_logged = {}
+
+-- Answers turtles asking for their program (runs all the time).
+local function deploy_server()
+  while true do
+    local sender, msg = rednet.receive(DEPLOY_PROTOCOL)
+    if type(msg) == "table" and msg.cmd == "want" and ROLE_PROGRAM[msg.role] then
+      local name = ROLE_PROGRAM[msg.role]
+      local p = live_program(name)
+      local who = msg.role == "miner" and ("lane " .. tostring(msg.lane)) or "the service turtle"
+      if not p then
+        if not missing_logged[name] then
+          missing_logged[name] = true
+          deploy_log("No '" .. name .. "' program to give " .. who .. " yet: press U to download it.")
+        end
+      elseif p.sum == msg.have then
+        queue_send(sender, { cmd = "current", role = msg.role }, DEPLOY_PROTOCOL)
+      else
+        queue_send(sender, { cmd = "program", role = msg.role, code = p.text }, DEPLOY_PROTOCOL)
+        deploy_log("Sent the newest program to " .. who .. ".")
+      end
+    end
+  end
+end
+
+local function update_staged()
+  for _, f in ipairs(FILES) do
+    if fs.exists("staged/" .. f[2]) then return true end
+  end
+  return false
+end
+
+-- Downloads all three programs from GitHub into staged/ with the "get"
+-- program. Every download must be a complete Lua program, or nothing is
+-- kept. `ref` is a commit (e.g. "bd6a041"); nil means the newest.
+local function download_update(ref)
+  local get = shell.resolveProgram("get") or (fs.exists("disk/get") and "disk/get") or nil
+  if not get then
+    return false, "No 'get' program on this computer. Copy it from the floppy: copy disk/get get"
+  end
+  local stamp = os.day() .. "-" .. math.floor(os.time() * 1000)
+  local fetched = {}
+  for _, f in ipairs(FILES) do
+    local url = REPO .. (ref or "refs/heads/main") .. "/" .. f[1]
+    if not ref then url = url .. "?nocache=" .. stamp end -- skip GitHub's cache
+    local tmp = f[2] .. ".download"
+    if fs.exists(tmp) then fs.delete(tmp) end
+    pcall(shell.run, get, url, tmp)
+    local text = read_file(tmp)
+    if fs.exists(tmp) then fs.delete(tmp) end
+    if not text or #text < 200 or not loadstring(text) then
+      return false, "Downloading " .. f[1] .. " failed, so nothing was changed."
+    end
+    fetched[f[2]] = text
+  end
+  if not fs.exists("staged") then fs.makeDir("staged") end
+  for name, text in pairs(fetched) do
+    local h = fs.open("staged/" .. name, "w")
+    h.write(text)
+    h.close()
+  end
+  return true
+end
+
+-- Installs a downloaded update. Only called when no run is in progress:
+-- moves staged/ into live/, replaces this program, tells the turtles to
+-- reboot (they fetch the new version as they boot) and reboots this
+-- computer. Turtles that miss the message are caught when they check in.
+local function apply_update()
+  if not fs.exists("live") then fs.makeDir("live") end
+  for _, f in ipairs(FILES) do
+    local name = f[2]
+    local target = (name == "c") and PROGRAM or ("live/" .. name)
+    if fs.exists("staged/" .. name) then
+      if fs.exists(target) then fs.delete(target) end
+      fs.move("staged/" .. name, target)
+    end
+  end
+  for _ = 1, 3 do
+    net_gap_wait()
+    rednet.broadcast({ cmd = "update_reboot" }, DEPLOY_PROTOCOL)
+  end
+  sleep(1)
+  os.reboot()
+end
+
+if OPTION == "update" then
+  print("Downloading the newest programs from GitHub...")
+  local ok, err = download_update(({ ... })[2])
+  if not ok then
+    print(err)
+    return
+  end
+  print("Downloaded. It installs as soon as no run is in progress.")
+end
+
+-- The last settings are remembered and reused; you're only asked the
+-- first time, after "c new", or after pressing C.
+local SETTINGS_FILE = "quarry.cfg"
+local CHUNK_SIZE = 16 -- blocks per lane per chunk (a Minecraft chunk)
+-- quarry.cfg: (unused: length and depth, from older versions), chunks
+local saved = { 16, 0, 0 }
+if fs.exists(SETTINGS_FILE) then
+  local f = fs.open(SETTINGS_FILE, "r")
+  for i = 1, 3 do saved[i] = tonumber(f.readLine()) or saved[i] end
+  f.close()
+end
+
+-- How many chunks have been mined completely, over all runs so far.
+local PROGRESS_FILE = "quarry.progress"
+local function read_progress()
+  if not fs.exists(PROGRESS_FILE) then return 0 end
+  local f = fs.open(PROGRESS_FILE, "r")
+  local n = tonumber(f.readLine())
+  f.close()
+  return n or 0
+end
+local function write_progress(n)
+  local f = fs.open(PROGRESS_FILE, "w")
+  f.write(n .. "\n")
+  f.close()
+end
+
+local function ask(question, default)
+  io.write(question .. " [" .. default .. "]: ")
+  return tonumber(read()) or default
+end
+
+-- A run in progress is saved to two files in turn, so a restart in the
+-- middle of writing one never loses both.
+local RUN_FILES = { ".quarry_run_a", ".quarry_run_b" }
+local run_seq = 0
+
+local function load_run()
+  local best
+  for _, name in ipairs(RUN_FILES) do
+    if fs.exists(name) then
+      local f = fs.open(name, "r")
+      local text = f.readAll()
+      f.close()
+      local ok, t = pcall(textutils.unserialize, text)
+      if ok and type(t) == "table" and type(t.seq) == "number"
+          and (not best or t.seq > best.seq) then
+        best = t
+      end
+    end
+  end
+  return best
+end
+
+local function clear_run()
+  for _, name in ipairs(RUN_FILES) do fs.delete(name) end
+end
+
+if OPTION == "new" then clear_run() end
+local resumed = load_run()
+
+local ASK_FILE = ".ask_settings" -- written by the C key
+local length, depth, chunks
+-- chunks mined in earlier runs, skipped by this one
+local skip = read_progress()
+local ask_now = fs.exists(ASK_FILE) or OPTION == "new" or not fs.exists(SETTINGS_FILE)
+if resumed then
+  -- (the turtles registered before the reboot are kept either way)
+  length, depth, chunks = resumed.length or CHUNK_SIZE, resumed.depth, resumed.chunks
+  skip = resumed.skip or 0
+  run_seq = resumed.seq
+end
+if resumed and resumed.started then
+  -- a run is in progress: carry on without asking anything
+  if fs.exists(ASK_FILE) then fs.delete(ASK_FILE) end
+elseif not ask_now then
+  if not resumed then length, chunks = CHUNK_SIZE, saved[3] end
+else
+  if fs.exists(ASK_FILE) then fs.delete(ASK_FILE) end
+  -- the questions are on the computer's own screen: say so on the monitor
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "monitor" then
+      local m = peripheral.wrap(name)
+      m.setBackgroundColor(colors.black)
+      m.clear()
+      m.setTextScale(1)
+      m.setCursorPos(2, 2)
+      m.write("Answer the questions on the")
+      m.setCursorPos(2, 3)
+      m.write("main computer's screen.")
+    end
+  end
+  parallel.waitForAny(function()
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("=== Chunk Quarry Control ===")
+    print("(press ENTER to keep the value in brackets)")
+    chunks = ask("Chunks to mine (0 = until stopped)", saved[3])
+    local mined = ask("Chunks already mined, to drive past (0 = start over)", read_progress())
+    write_progress(math.max(0, math.floor(mined)))
+  end, deploy_server, sender_loop) -- keep handing out programs while you type
+  length = CHUNK_SIZE
+  skip = read_progress()
+
+  local f = fs.open(SETTINGS_FILE, "w")
+  f.write(length .. "\n0\n" .. chunks .. "\n")
+  f.close()
+end
+
+-- The last chunk this run mines (0 = until stopped).
+local function last_chunk_no()
+  return chunks == 0 and 0 or skip + chunks
+end
+
+-- depth = layers down to bedrock, as reported by the miners (nil until
+-- one has found it). Miners clear 3 layers per pass.
+local function passes() return depth and math.ceil(depth / 3) end
+local function depth_text() return depth and tostring(depth) or "?" end
+
+-- State ---------------------------------------------------------------------
+local miners = {}        -- [lane] = { id=, status=, chunk=, pass=, y=, fuel=, seen= }
+local done = {}          -- [lane] = last chunk that lane finished
+local stopped = {}       -- [lane] = true once we've told it to stop
+local started = false
+local started_at
+local stop_requested = false
+local finished = false   -- no more chunks: answer everything with "stop"
+local last_chunk = false -- lane 0 is out of loaders: end after this chunk
+local all_home = false
+local current_chunk = 1
+local service = { state = "not heard from yet" }
+local log_lines = {}
+local program_start = os.clock()
+local confirm_stop_until = 0
+
+-- Saves everything needed to carry on after a restart. Called after every
+-- change to the run.
+local function save_run()
+  run_seq = run_seq + 1
+  local lanes = {}
+  for lane, m in pairs(miners) do lanes[lane] = { id = m.id, home = m.home } end
+  local f = fs.open(RUN_FILES[run_seq % 2 + 1], "w")
+  f.write(textutils.serialize({
+    seq = run_seq, length = length, depth = depth, chunks = chunks, skip = skip,
+    started = started, elapsed = started_at and (os.clock() - started_at) or 0,
+    current_chunk = current_chunk, stop_requested = stop_requested,
+    finished = finished, last_chunk = last_chunk,
+    lanes = lanes, done = done, stopped = stopped,
+  }))
+  f.close()
+end
+
+if resumed then
+  started, current_chunk = resumed.started, resumed.current_chunk
+  stop_requested, finished = resumed.stop_requested, resumed.finished
+  last_chunk = resumed.last_chunk
+  if started then started_at = os.clock() - (resumed.elapsed or 0) end
+  done, stopped = resumed.done or {}, resumed.stopped or {}
+  for lane, l in pairs(resumed.lanes or {}) do
+    miners[lane] = {
+      id = l.id, home = l.home,
+      status = l.home and "finished" or (started and "restarted, waiting" or "registered"),
+    }
+  end
+  -- new answers to the questions: save them with the kept lanes
+  if not started and ask_now then save_run() end
+end
+
+local function sorted_lanes()
+  local lanes = {}
+  for lane in pairs(miners) do table.insert(lanes, lane) end
+  table.sort(lanes)
+  return lanes
+end
+
+local function fmt_time(s)
+  s = math.floor(s)
+  local h, m, sec = math.floor(s / 3600), math.floor(s / 60) % 60, s % 60
+  if h > 0 then return string.format("%d:%02d:%02d", h, m, sec) end
+  return string.format("%d:%02d", m, sec)
+end
+
+-- (coarse on purpose: a line that doesn't change isn't redrawn)
+local function ago(t)
+  if not t then return "-" end
+  local s = math.floor(os.clock() - t)
+  if s < 60 then return "<1m" end
+  if s < 3600 then return math.floor(s / 60) .. "m" end
+  return math.floor(s / 3600) .. "h"
+end
+
+-- Log -----------------------------------------------------------------------
+local WARN_WORDS = {
+  "WARNING", "Out of", "full", "empty", "Can't", "Couldn't", "blocked",
+  "never answered", "isn't fuel", "in my way", "Two turtles",
+}
+
+local function is_warning(text)
+  for _, word in ipairs(WARN_WORDS) do
+    if text:find(word, 1, true) then return true end
+  end
+  return false
+end
+
+local function add_log(source, text)
+  local entry = {
+    time = fmt_time(os.clock() - program_start),
+    source = source, text = text, warn = is_warning(text),
+  }
+  table.insert(log_lines, entry)
+  if #log_lines > MAX_LOG then table.remove(log_lines, 1) end
+  local f = fs.open(LOG_FILE, "a")
+  if f then
+    f.writeLine(entry.time .. " [" .. source .. "] " .. text)
+    f.close()
+  end
+end
+
+-- Colors --------------------------------------------------------------------
+local function status_color(s)
+  s = s or ""
+  if s:find("OUT OF") or s:find("FULL") or s:find("EMPTY") or s:find("BAD") or s:find("LOST")
+      or s:find("blocked") or s:find("stuck") or s:find("can't") then
+    return colors.red
+  end
+  if s:find("^mining") or s:find("work") then return colors.lime end
+  if s:find("resum") or s:find("restarted") or s:find("finding") then return colors.purple end
+  if s:find("service") or s:find("unloading") then return colors.yellow end
+  if s:find("done") then return colors.cyan end
+  if s:find("^to chunk") or s:find("^going") then return colors.lightBlue end
+  if s:find("restocking") then return colors.orange end
+  if s:find("finished") or s:find("stopped") or s:find("idle")
+      or s:find("not heard") then
+    return colors.lightGray
+  end
+  return colors.white
+end
+
+local function source_color(source)
+  if source == "control" then return colors.cyan end
+  if source == "service" then return colors.orange end
+  return colors.lightBlue
+end
+
+local function run_state()
+  if all_home then return "DONE", colors.lightGray end
+  if finished then return "HEADING HOME", colors.orange end
+  if stop_requested then return "STOPPING", colors.orange end
+  if last_chunk then return "LAST CHUNK", colors.orange end
+  if started then return "RUNNING", colors.lime end
+  return "READY", colors.yellow
+end
+
+-- Drawing helpers -------------------------------------------------------------
+local color_cache = {} -- colors each screen is set to (skip repeats)
+local function set_colors(t, fg, bg)
+  if t.isColor and t.isColor() then
+    local c = color_cache[t]
+    if not c then c = {}; color_cache[t] = c end
+    if c.fg ~= fg then t.setTextColor(fg); c.fg = fg end
+    if c.bg ~= bg then t.setBackgroundColor(bg); c.bg = bg end
+  else
+    t.setTextColor(colors.white)
+    t.setBackgroundColor(colors.black)
+  end
+end
+
+local function pad(s, w)
+  s = tostring(s)
+  if #s >= w then return s:sub(1, w) end
+  return s .. string.rep(" ", w - #s)
+end
+
+-- Draws one full row: `left` pieces from the left edge, `right` pieces
+-- against the right edge. A piece is { text, fg, bg }.
+-- What each screen shows now, per line: a line that hasn't changed isn't
+-- drawn again (every monitor call is sent to the players nearby).
+local row_cache = {}
+local function forget_screen(t) row_cache[t] = nil; color_cache[t] = nil end
+
+local function row(t, y, left, right, fill)
+  local w = t.getSize()
+  fill = fill or colors.black
+  local sig = { w, fill }
+  for _, p in ipairs(left) do sig[#sig + 1] = p[1] .. "\1" .. tostring(p[2]) .. "\1" .. tostring(p[3]) end
+  sig[#sig + 1] = "\2"
+  for _, p in ipairs(right or {}) do sig[#sig + 1] = p[1] .. "\1" .. tostring(p[2]) .. "\1" .. tostring(p[3]) end
+  sig = table.concat(sig, "\3")
+  row_cache[t] = row_cache[t] or {}
+  if row_cache[t][y] == sig then return end
+  row_cache[t][y] = sig
+  local right_len = 0
+  for _, p in ipairs(right or {}) do right_len = right_len + #p[1] end
+  local limit = w - right_len
+  t.setCursorPos(1, y)
+  local x = 1
+  for _, p in ipairs(left) do
+    local text = p[1]
+    if x + #text - 1 > limit then text = text:sub(1, math.max(0, limit - x + 1)) end
+    if #text > 0 then
+      set_colors(t, p[2] or colors.white, p[3] or fill)
+      t.write(text)
+      x = x + #text
+    end
+  end
+  if x <= limit then
+    set_colors(t, colors.white, fill)
+    t.write(string.rep(" ", limit - x + 1))
+  end
+  for _, p in ipairs(right or {}) do
+    set_colors(t, p[2] or colors.white, p[3] or fill)
+    t.write(p[1])
+  end
+end
+
+-- Appends a progress bar (two pieces) to `pieces`.
+local function add_bar(t, pieces, frac, width)
+  local n = math.floor(math.max(0, math.min(1, frac)) * width + 0.5)
+  if t.isColor and t.isColor() then
+    table.insert(pieces, { string.rep(" ", n), colors.white, colors.lime })
+    table.insert(pieces, { string.rep(" ", width - n), colors.white, colors.gray })
+  else
+    table.insert(pieces, { string.rep("#", n) .. string.rep("-", width - n) })
+  end
+end
+
+local function lane_progress(lane)
+  local m = miners[lane]
+  if all_home or (done[lane] or 0) >= current_chunk then return 1 end
+  if m.chunk == current_chunk and m.pass and passes() then
+    return math.min((m.pass - 1) / passes(), 1)
+  end
+  return 0
+end
+
+local function chunk_progress()
+  local total, n = 0, 0
+  for lane in pairs(miners) do
+    total = total + lane_progress(lane)
+    n = n + 1
+  end
+  if n == 0 then return 0 end
+  return total / n
+end
+
+-- Monitor dashboard -----------------------------------------------------------
+local mon
+-- Touch buttons on the monitor: { y=, x1=, x2=, name= } (see touched() in
+-- ui_loop). The main computer may sit up a tall tower (radio range), so
+-- everything can be done from the monitor.
+local buttons = {}
+local confirm_update_until = 0
+local panel -- the settings panel while it's open: { chunks=, mined= }
+
+-- Adds a row's pieces one at a time, remembering where buttons are.
+local function button_row(y)
+  local r = { pieces = {}, x = 1 }
+  function r.text(text, fg, bg)
+    table.insert(r.pieces, { text, fg or colors.white, bg })
+    r.x = r.x + #text
+  end
+  function r.button(label, name, bg)
+    table.insert(buttons, { y = y, x1 = r.x, x2 = r.x + #label - 1, name = name })
+    r.text(label, colors.white, bg or colors.gray)
+  end
+  return r
+end
+
+local function find_monitor()
+  mon = nil
+  for _, name in ipairs(peripheral.getNames()) do
+    if peripheral.getType(name) == "monitor" then
+      mon = peripheral.wrap(name)
+      break
+    end
+  end
+  if not mon then return end
+  -- use the biggest text that still fits the whole dashboard
+  for _, scale in ipairs({ 1.5, 1, 0.5 }) do
+    mon.setTextScale(scale)
+    local w, h = mon.getSize()
+    if w >= 60 and h >= 32 then break end
+  end
+end
+
+local function do_start()
+  if started then return end
+  if not next(miners) then
+    add_log("control", "Can't start: no turtles registered yet.")
+    return
+  end
+  started = true
+  started_at = os.clock()
+  panel = nil -- (a settings panel left open closes)
+  skip = read_progress()
+  local lanes = sorted_lanes()
+  add_log("control", string.format("Started %d lanes: down to bedrock, %s.",
+    #lanes, chunks == 0 and "until stopped" or (chunks .. " chunks")))
+  if skip > 0 then
+    add_log("control", "Chunks 1-" .. skip .. " were mined before: driving past them.")
+  end
+  for _, lane in ipairs(lanes) do
+    queue_send(miners[lane].id, {
+      cmd = "start", id = lane, length = length, depth = depth, chunks = last_chunk_no(),
+      chunk = current_chunk, skip = skip,
+    }, PROTOCOL)
+    miners[lane].status = "starting"
+    miners[lane].at_home = nil
+    miners[lane].confirmed = nil
+    miners[lane].stop_heard, miners[lane].stop_sent = nil, nil
+  end
+  save_run()
+end
+
+local tell_stop -- (defined with the fleet control code below)
+
+local function do_stop()
+  if not started or stop_requested or finished then return end
+  stop_requested = true
+  add_log("control", "Stop requested: lanes finish their current pass and go home.")
+  save_run()
+  for lane in pairs(miners) do tell_stop(lane) end
+end
+
+-- The settings panel (SET): big text and big buttons at the bottom of the
+-- monitor, where you stand. The monitor switches to the largest text that
+-- fits it while it's open.
+local PANEL_W, PANEL_H = 40, 19
+local panel_scaled = false
+
+local function center(text, width)
+  local left = math.floor((width - #text) / 2)
+  return string.rep(" ", left) .. text .. string.rep(" ", width - #text - left)
+end
+
+local function draw_panel(t)
+  if not panel_scaled then
+    for _, sc in ipairs({ 5, 4.5, 4, 3.5, 3, 2.5, 2, 1.5, 1, 0.5 }) do
+      t.setTextScale(sc)
+      local w, h = t.getSize()
+      if w >= PANEL_W and h >= PANEL_H then break end
+    end
+    t.setBackgroundColor(colors.black)
+    t.clear()
+    forget_screen(t)
+    panel_scaled = true
+  end
+  buttons = {}
+  local w, h = t.getSize()
+  local left = string.rep(" ", math.max(0, math.floor((w - PANEL_W) / 2)))
+  local top = math.max(1, h - PANEL_H + 1) -- (at the bottom)
+  local y = 1
+  while y < top do row(t, y, {}) y = y + 1 end
+  local function line(pieces)
+    table.insert(pieces, 1, { left })
+    row(t, y, pieces)
+    y = y + 1
+  end
+  -- a row of 3-line buttons (items with a name) and text (without)
+  local function boxes(items)
+    for l = 0, 2 do
+      local pieces = { { left } }
+      local x = #left + 1
+      for _, it in ipairs(items) do
+        local text = (l == 1) and center(it.label, it.w) or string.rep(" ", it.w)
+        table.insert(pieces, { text, it.fg or colors.white, it.name and (it.bg or colors.gray) or nil })
+        if it.name and l == 0 then
+          table.insert(buttons, { y = y, y2 = y + 2, x1 = x, x2 = x + it.w - 1, name = it.name })
+        end
+        x = x + it.w
+      end
+      row(t, y, pieces)
+      y = y + 1
+    end
+  end
+  local function setting(label, value, key, note)
+    line({ { " " .. label, colors.white } })
+    local gap = { label = "", w = 1 }
+    boxes({
+      { label = "-10", w = 6, name = key .. "-10" }, gap,
+      { label = "-1", w = 5, name = key .. "-1" }, gap,
+      { label = tostring(value), w = 8, fg = colors.yellow }, gap,
+      { label = "+1", w = 5, name = key .. "+1" }, gap,
+      { label = "+10", w = 6, name = key .. "+10" },
+    })
+    line({ { " " .. note, colors.lightGray } })
+    line({})
+  end
+  line({ { center("SETTINGS", PANEL_W), colors.yellow } })
+  line({})
+  setting("Chunks to mine", panel.chunks == 0 and "no limit" or panel.chunks, "c", "0 = no limit")
+  setting("Already mined (driven past)", panel.mined, "m", "0 = start over at chunk 1")
+  boxes({
+    { label = "SAVE", w = 14, name = "save", bg = colors.green },
+    { label = "", w = 4 },
+    { label = "CANCEL", w = 14, name = "cancel", bg = colors.red },
+  })
+  while y <= h do row(t, y, {}) y = y + 1 end
+end
+
+local function draw_monitor()
+  local t = mon
+  if panel and not started then
+    draw_panel(t)
+    return
+  end
+  if panel_scaled then -- (back from the panel: the dashboard's text size)
+    panel_scaled = false
+    find_monitor()
+    t = mon
+    t.setBackgroundColor(colors.black)
+    t.clear()
+    forget_screen(t)
+  end
+  local w, h = t.getSize()
+  local y = 1
+
+  -- Title bar with the touch button on the right.
+  local state, state_color = run_state()
+  local title = {
+    { " QUARRY " .. VERSION .. " ", colors.white, colors.blue },
+    { string.format(" Chunk %d/%s  ", current_chunk, chunks == 0 and "inf" or tostring(last_chunk_no())), colors.white },
+    { state, state_color },
+  }
+  -- buttons on the right: UPD(ate), SET(tings), LOG(s), START / STOP
+  buttons = {}
+  local right = {}
+  if started then
+    -- (hours and minutes only: the title isn't redrawn every second)
+    local elapsed = math.floor((os.clock() - (started_at or os.clock())) / 60)
+    table.insert(right, { string.format(" %dh%02dm ", math.floor(elapsed / 60), elapsed % 60), colors.white })
+  end
+  local function add(label, name, bg) table.insert(right, { label, colors.white, bg, name = name }) end
+  if not started then
+    if os.clock() < confirm_update_until then
+      add(" UPDATE? ", "confirm_update", colors.orange)
+    else
+      add(" UPD ", "update", colors.lightGray)
+    end
+    add(" ", nil, nil)
+    add(" SET ", "settings", colors.lightGray)
+    add(" ", nil, nil)
+  end
+  add(" LOG ", "logs", colors.lightGray)
+  add(" ", nil, nil)
+  if not started then
+    add(" START ", "start", colors.green)
+  elseif not stop_requested and not finished then
+    if os.clock() < confirm_stop_until then
+      add(" CONFIRM STOP? ", "confirm_stop", colors.orange)
+    else
+      add(" STOP ", "stop", colors.red)
+    end
+  end
+  local total = 0
+  for _, p in ipairs(right) do total = total + #p[1] end
+  local x = w - total + 1
+  for _, p in ipairs(right) do
+    if p.name then table.insert(buttons, { y = h, x1 = x, x2 = x + #p[1] - 1, name = p.name }) end
+    x = x + #p[1]
+  end
+  -- (the title bar goes on the bottom row, drawn last: nearest to you)
+  local title_row = h
+  h = h - 1
+
+
+  -- Settings and overall progress through the current chunk.
+  local frac = chunk_progress()
+  local prefix = string.format(" Length %d  Depth %s   Chunk ", length, depth_text())
+  local pieces = { { prefix, colors.lightGray } }
+  add_bar(t, pieces, frac, math.max(10, w - #prefix - 6))
+  table.insert(pieces, { string.format(" %3d%%", math.floor(frac * 100 + 0.5)), colors.white })
+  row(t, y, pieces)
+  y = y + 2
+
+  -- Lane table.
+  local wide = w >= 80
+  local fixed = 6 + 7 + 8 + 6 + 8 + 6 + 5 + (wide and 12 or 0)
+  local miner_ver = served_version("miner")
+  local sw = math.max(10, w - fixed)
+  row(t, y, { { pad(" LANE", 6) .. pad("STATUS", sw) .. pad("CHUNK", 7) .. pad("PASS", 8)
+    .. (wide and pad("PROGRESS", 12) or "") .. pad("Y", 6) .. pad("FUEL", 8) .. pad("SEEN", 6) .. "VER", colors.gray } })
+  y = y + 1
+  local lanes = sorted_lanes()
+  if #lanes == 0 then
+    row(t, y, { { "  No turtles registered yet. Start the miners (m <lane>).", colors.lightGray } })
+    y = y + 1
+  end
+  for _, lane in ipairs(lanes) do
+    if y > h then break end
+    local m = miners[lane]
+    local quiet = started and m.seen and os.clock() - m.seen > 300 and not all_home
+    pieces = {
+      { pad(" " .. lane, 4), colors.white },
+      -- "T": this lane throws junk in its trash can
+      { pad(m.trash and "T" or "", 2), colors.lime },
+      { pad(m.status or "", sw), status_color(m.status) },
+      { pad(m.chunk or "-", 7), colors.white },
+      { pad(m.pass and (m.pass .. "/" .. (passes() or "?")) or "-", 8), colors.white },
+    }
+    if wide then
+      add_bar(t, pieces, lane_progress(lane), 10)
+      table.insert(pieces, { "  " })
+    end
+    table.insert(pieces, { pad(m.y or "-", 6), colors.white })
+    table.insert(pieces, { pad(m.fuel or "?", 8), colors.white })
+    table.insert(pieces, { pad(ago(m.seen), 6), quiet and colors.red or colors.lightGray })
+    -- red: not running the version we'd hand out (it updates between runs)
+    table.insert(pieces, { pad(m.ver or "?", 5), m.ver == miner_ver and colors.lime or colors.red })
+    row(t, y, pieces)
+    y = y + 1
+  end
+  if y <= h then row(t, y, {}) y = y + 1 end
+
+  -- Service turtle panel.
+  -- (idle at home it says nothing, on purpose: only silence while busy is odd)
+  local quiet = started and service.seen and os.clock() - service.seen > 300
+    and service.state ~= "idle at home"
+  local stock_low = service.stock and service.stock < 16
+  local service_rows = {
+    {
+      { " SERVICE  ", colors.orange },
+      { pad(service.state or "", 24), status_color(service.state) },
+      { pad("lane " .. (service.lane or "-"), 10), colors.white },
+      { "queue " .. (service.queue or 0), colors.white },
+    },
+    {
+      { "          " },
+      { pad("fuel " .. (service.fuel or "?"), 14), colors.white },
+      { pad("coal stock " .. (service.stock or "?"), 17), stock_low and colors.red or colors.white },
+      { pad("seen " .. ago(service.seen), 12), quiet and colors.red or colors.lightGray },
+      { service.ver or "?", service.ver == served_version("service") and colors.lime or colors.red },
+    },
+    { { "          last: " .. (service.last_text or "-"), colors.lightGray } },
+  }
+  for _, pieces_row in ipairs(service_rows) do
+    if y <= h then
+      row(t, y, pieces_row)
+      y = y + 1
+    end
+  end
+  if y <= h then row(t, y, {}) y = y + 1 end
+
+  -- Log: newest at the bottom, filling the rest of the screen.
+  if y <= h then
+    row(t, y, { { " LOG ", colors.white, colors.gray }, { "  also saved to " .. LOG_FILE, colors.gray } })
+    y = y + 1
+  end
+  local rows = h - y + 1
+  local first = math.max(1, #log_lines - rows + 1)
+  for i = first, first + rows - 1 do
+    local e = log_lines[i]
+    if e then
+      row(t, y, {
+        { " " .. pad(e.time, 8), colors.gray },
+        { pad(e.source, 9), source_color(e.source) },
+        { e.text, e.warn and colors.red or colors.white },
+      })
+    else
+      row(t, y, {})
+    end
+    y = y + 1
+  end
+  row(t, title_row, title, right, colors.gray)
+end
+
+-- Computer screen (51x19): compact view, same as before plus the latest log.
+local function draw_terminal()
+  local t = term
+  local w, h = t.getSize()
+  local state, state_color = run_state()
+  row(t, 1, {
+    { VERSION .. " ", colors.lightBlue },
+    { string.format("L=%d D=%s chunk %d/%s ", length, depth_text(), current_chunk,
+      chunks == 0 and "inf" or tostring(last_chunk_no())), colors.white },
+    { state, state_color },
+  })
+  local y = 2
+  for _, lane in ipairs(sorted_lanes()) do
+    if y > h - 2 then break end
+    local m = miners[lane]
+    row(t, y, {
+      { string.format("%2d c%-3s y%-4s f%-6s ", lane, tostring(m.chunk or 0),
+        tostring(m.y or 0), tostring(m.fuel or "?")), colors.white },
+      { m.status or "", status_color(m.status) },
+    })
+    y = y + 1
+  end
+  while y <= h - 2 do row(t, y, {}) y = y + 1 end
+  local last = log_lines[#log_lines]
+  row(t, h - 1, { { last and (last.source .. ": " .. last.text) or "",
+    last and last.warn and colors.red or colors.lightGray } })
+  local help
+  if not started then
+    help = "ENTER start U update C settings L logs (" .. #sorted_lanes() .. " ready)"
+  elseif all_home then
+    help = "Done."
+  elseif finished or stop_requested then
+    help = "Finishing up... (Q = quit)"
+  else
+    help = "S = stop   L = upload logs"
+  end
+  if mon then help = help .. "   [dashboard on monitor]" end
+  row(t, h, { { help, colors.yellow } })
+end
+
+local last_draw = -math.huge
+local last_draw_error
+local redraw_due = false
+local function draw_all(force)
+  if not force and os.clock() - last_draw < 1 then
+    if not redraw_due then
+      redraw_due = true
+      os.queueEvent("redraw") -- (maintenance_loop draws it a second later)
+    end
+    return
+  end
+  redraw_due = false
+  last_draw = os.clock()
+  draw_terminal()
+  if mon then
+    local ok, err = pcall(draw_monitor)
+    if not ok then
+      -- e.g. the monitor was broken or resized mid-draw
+      if err ~= last_draw_error then
+        last_draw_error = err
+        add_log("control", "Display error: " .. tostring(err))
+      end
+      find_monitor()
+    end
+  end
+end
+
+-- Fleet control ---------------------------------------------------------------
+local function send(lane, msg)
+  queue_send(miners[lane].id, msg, PROTOCOL)
+end
+
+-- Re-sent now and then (see maintenance_loop) until the lane says it's
+-- heading home: it may have been restarting when the first one came.
+function tell_stop(lane)
+  send(lane, { cmd = "stop", id = lane })
+  miners[lane].stop_sent = os.clock()
+  if not stopped[lane] then
+    stopped[lane] = true
+    miners[lane].status = "stopped, going home"
+    save_run()
+  end
+end
+
+local function all_stopped()
+  for lane in pairs(miners) do
+    if not stopped[lane] then return false end
+  end
+  return true
+end
+
+local function check_all_home()
+  if all_home or not next(miners) then return end
+  for _, m in pairs(miners) do
+    -- m.confirmed: the lane said so since we booted (after a server crash
+    -- our saved notes can be ahead of the world)
+    if not (m.home and m.confirmed) then return end
+  end
+  all_home = true
+  clear_run() -- the run is over: next boot starts fresh
+  if update_staged() then
+    add_log("control", "All lanes are home. Installing the downloaded update...")
+    draw_all(true)
+    apply_update()
+  end
+  add_log("control", "All lanes are home. The next run starts with ENTER or START.")
+  -- ready for the next run with the same settings
+  started, started_at = false, nil
+  current_chunk = 1
+  skip = read_progress()
+  done, stopped = {}, {}
+  stop_requested, finished, last_chunk, all_home = false, false, false, false
+  for _, m in pairs(miners) do
+    m.home, m.at_home, m.confirmed, m.pass, m.chunk = nil, nil, nil, nil, nil
+    m.status = "finished"
+  end
+end
+
+-- Between runs, a turtle started by the boot loader that reports an old
+-- program version is told to reboot (it fetches the new one as it boots).
+local nudges = {} -- [computer id] = { count=, at= }
+local function nudge_if_outdated(sender, role, version, who)
+  if started or not version then return end
+  local p = live_program(ROLE_PROGRAM[role])
+  if not p or p.sum == version then return end
+  local n = nudges[sender] or { count = 0, at = -math.huge }
+  if n.count >= 3 or os.clock() - n.at < 30 then return end
+  n.count, n.at = n.count + 1, os.clock()
+  nudges[sender] = n
+  queue_send(sender, { cmd = "update_reboot" }, DEPLOY_PROTOCOL)
+  add_log("control", "Telling " .. who .. " to reboot into the newest version.")
+end
+
+-- Called when a lane reports chunk_done: if everyone is done, either move
+-- the fleet to the next chunk or finish.
+local function try_advance()
+  for lane in pairs(miners) do
+    if (done[lane] or 0) < current_chunk then return end
+  end
+  -- every lane has finished this chunk: remember it for the next run
+  if current_chunk > read_progress() then write_progress(current_chunk) end
+  if stop_requested or last_chunk or (chunks ~= 0 and current_chunk >= last_chunk_no()) then
+    finished = true
+    if stop_requested then
+      add_log("control", "Stopped after chunk " .. current_chunk .. ". Lanes are heading home.")
+    else
+      add_log("control", "Run complete: mined up to chunk " .. current_chunk .. ". Lanes are heading home.")
+    end
+    for lane in pairs(miners) do tell_stop(lane) end
+  else
+    add_log("control", "All lanes finished chunk " .. current_chunk
+      .. ". Moving to chunk " .. (current_chunk + 1) .. ".")
+    current_chunk = current_chunk + 1
+    -- one message every lane hears at once (they all set off together)
+    queue_send(nil, { cmd = "next_chunk", chunk = current_chunk }, PROTOCOL)
+    for lane in pairs(miners) do
+      miners[lane].status = "to chunk " .. current_chunk
+      miners[lane].pass = nil
+    end
+  end
+  save_run()
+end
+
+-- Lane 0 may take the loaders back once every other lane is home and the
+-- service turtle is back on its home row with nothing to do.
+local function may_collect(lane)
+  local waiting = {}
+  for other, m in pairs(miners) do
+    -- on its start spot (maybe still unloading) is out of the way too
+    if other ~= lane and not ((m.home and m.confirmed) or m.at_home) then
+      table.insert(waiting, "lane " .. other)
+    end
+  end
+  table.sort(waiting)
+  -- the service turtle only has to be on its home row (out of the lanes)
+  if not service.on_row then
+    table.insert(waiting, "the service turtle")
+  end
+  return #waiting == 0, waiting
+end
+
+local function handle(sender, msg)
+  if type(msg) ~= "table" or type(msg.id) ~= "number" then return end
+  local lane = msg.id
+  local m = miners[lane]
+
+  if msg.cmd == "hello" then
+    nudge_if_outdated(sender, "miner", msg.version, "lane " .. lane)
+    if m and m.id == sender then m.ver = msg.ver or "old" end
+    if not started then
+      if m and m.id ~= sender then
+        add_log("control", "Two turtles claim lane " .. lane .. "! Check their lane numbers.")
+      end
+      if not m then add_log("control", "Lane " .. lane .. " registered.") end
+      local changed = not m or m.id ~= sender
+      miners[lane] = m or {}
+      miners[lane].id = sender
+      miners[lane].status = "registered"
+      miners[lane].seen = os.clock()
+      if changed or not msg.registered then send(lane, { cmd = "registered", id = lane }) end
+      if changed then save_run() end
+    elseif not m and not finished and not stop_requested then
+      -- a lane that turned up after START (e.g. still fetching its
+      -- program): join the run at the current chunk
+      add_log("control", "Lane " .. lane .. " registered late: joining the run.")
+      miners[lane] = { id = sender, status = "starting", seen = os.clock() }
+      send(lane, { cmd = "start", id = lane, length = length, depth = depth,
+        chunks = last_chunk_no(), chunk = current_chunk, skip = skip })
+      save_run()
+    elseif m and m.id == sender and not finished and not stop_requested and not stopped[lane] then
+      -- it missed the start message, or was reset with "here": (re)join
+      -- the run at the current chunk
+      m.home, m.at_home, m.confirmed = nil, nil, nil
+      send(lane, { cmd = "start", id = lane, length = length, depth = depth,
+        chunks = last_chunk_no(), chunk = current_chunk, skip = skip })
+    elseif m and m.id == sender and not (m.home and m.confirmed) then
+      -- A turtle only says hello when it has no run left: this one is on
+      -- its start spot. (Its "finished" may have been lost in a restart.)
+      m.home, m.confirmed = true, true
+      m.status = "finished"
+      save_run()
+      check_all_home()
+    end
+    return
+  end
+
+  -- everything else must come from a registered turtle
+  if not m or m.id ~= sender then return end
+  m.seen = os.clock()
+
+  if msg.cmd == "may_collect" then
+    local ok, waiting = may_collect(lane)
+    if ok then
+      if m.status ~= "collecting loaders" then
+        add_log("control", "Everyone else is home: lane " .. lane .. " is picking up the loaders.")
+      end
+      m.status = "collecting loaders"
+      send(lane, { cmd = "collect", id = lane })
+    else
+      m.status = "waiting for " .. waiting[1]
+    end
+  elseif msg.cmd == "chunk_done" then
+    if msg.no_next_loader and not last_chunk then
+      -- lane 0 couldn't load the next chunk, so nobody may drive into it:
+      -- let everyone finish this chunk, then end the run
+      last_chunk = true
+      add_log("control", "No loader for the next chunk, so this chunk is the last one.")
+    end
+    if (done[lane] or 0) < msg.chunk then
+      done[lane] = msg.chunk
+      save_run()
+    end
+    m.chunk = msg.chunk
+    if finished or stop_requested then
+      tell_stop(lane)
+    elseif msg.chunk < current_chunk then
+      -- behind: it missed the next_chunk message, or a server crash put
+      -- it back. Send it on to the chunk after the one it just finished.
+      send(lane, { cmd = "next_chunk", id = lane, chunk = msg.chunk + 1 })
+    else
+      m.status = "chunk " .. msg.chunk .. " done, waiting"
+      try_advance()
+    end
+  end
+end
+
+-- States a lane only ever reports while on its start spot.
+local HOME_STATES = {
+  ["home, unloading"] = true, ["waiting for service"] = true, ["unloading"] = true,
+  ["stopped, at home"] = true, ["finished"] = true,
+}
+
+-- States that show a lane got its "stop" (no need to send it again).
+local STOP_HEARD = {
+  ["going home"] = true, ["stopped, at home"] = true, ["home, unloading"] = true,
+  ["finished"] = true, ["waiting to collect loaders"] = true, ["collecting loaders"] = true,
+}
+
+-- Status updates from the miners and the service turtle (dashboard only).
+local function handle_status(sender, msg)
+  if type(msg) ~= "table" then return end
+  if msg.cmd == "service" then
+    service.state, service.lane, service.queue = msg.state, msg.lane or nil, msg.queue
+    service.fuel, service.stock, service.seen = msg.fuel, msg.stock, os.clock()
+    service.on_row = msg.on_row
+    nudge_if_outdated(sender, "service", msg.version, "the service turtle")
+    service.ver = msg.ver or "old"
+    for _, text in ipairs(msg.texts or { msg.text }) do
+      service.last_text = text
+      add_log("service", text)
+    end
+  elseif msg.cmd == "status" and type(msg.id) == "number" then
+    local m = miners[msg.id]
+    if m and m.id == sender then
+      m.seen = os.clock()
+      m.ver = msg.ver or "old"
+      local info = msg.info
+      if type(info) == "table" then
+        m.chunk, m.pass, m.y, m.fuel = info.chunk, info.pass, info.y, info.fuel
+        m.trash = info.trash
+        if type(info.depth) == "number" and info.depth ~= depth then
+          depth = info.depth
+          add_log("control", "Bedrock found: mining " .. depth .. " layers deep.")
+          save_run()
+        end
+      end
+      if msg.state == "working" and m.pass then msg.state = "mining pass " .. m.pass end
+      if msg.state then m.status = msg.state end
+      if msg.state and STOP_HEARD[msg.state] then m.stop_heard = true end
+      -- on its start spot (all servicing happens there): out of the way
+      if msg.state then m.at_home = HOME_STATES[msg.state] or nil end
+      if msg.state == "finished" then
+        m.confirmed = true
+        if not m.home then
+          m.home = true
+          save_run()
+        end
+      end
+      if msg.state == "resuming" or msg.state == "recovered after crash" then
+        -- restarted with a run on: not home (a crash may have put it back
+        -- in the tunnel after it had got home)
+        m.at_home, m.confirmed = nil, nil
+        if m.home then
+          m.home = nil
+          save_run()
+        end
+        -- STOP pressed: it may have missed it while restarting. (After a
+        -- normal finish a crash can put a lane back mid-chunk: it mines
+        -- that chunk again and is told to stop when it reports it done.)
+        m.stop_heard = nil
+        if stop_requested then
+          tell_stop(msg.id)
+        elseif stopped[msg.id] then
+          stopped[msg.id] = nil
+          save_run()
+        end
+      end
+    end
+    for _, text in ipairs(msg.texts or { msg.text }) do
+      add_log("lane " .. msg.id, text)
+    end
+    -- what else the lane had to tell us rides along with its status
+    if type(msg.hello) == "table" then
+      handle(sender, { cmd = "hello", id = msg.id, version = msg.hello.version, ver = msg.ver,
+        registered = msg.hello.registered })
+    end
+    if type(msg.chunk_done) == "table" then
+      handle(sender, { cmd = "chunk_done", id = msg.id, chunk = msg.chunk_done.chunk,
+        no_next_loader = msg.chunk_done.no_next_loader })
+    end
+    if msg.may_collect then handle(sender, { cmd = "may_collect", id = msg.id }) end
+    check_all_home()
+  end
+end
+
+-- Main ----------------------------------------------------------------------
+local function network_loop()
+  while true do
+    local sender, msg, protocol = rednet.receive() -- (sleeps until one comes)
+    if protocol == PROTOCOL then
+      handle(sender, msg)
+    elseif protocol == STATUS_PROTOCOL then
+      handle_status(sender, msg)
+    end
+    draw_all(false)
+  end
+end
+
+-- Uploads text to a paste site (no account needed) and returns its web
+-- address, or nil and why not. (pastebin's old API no longer works.)
+local function upload(text)
+  if not http then return nil, "HTTP is turned off on this server" end
+  local r = http.post("https://paste.rs/", text)
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url end
+  end
+  r = http.post("https://dpaste.com/api/v2/",
+    "expiry_days=30&content=" .. textutils.urlEncode(text))
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url .. ".txt" end
+  end
+  return nil, "paste.rs and dpaste.com both refused (blocked by the server?)"
+end
+
+-- L key: every turtle uploads its own log (they report the web address,
+-- which lands in our log), and a minute later our log goes up too: that
+-- one address has everything.
+local log_timer
+local function collect_logs()
+  -- (one message that every turtle hears)
+  queue_send(nil, { cmd = "upload_log" }, PROTOCOL)
+  add_log("control", "Asked every turtle to upload its log. The full log goes up in a minute...")
+  log_timer = os.startTimer(60)
+end
+
+local function upload_quarry_log()
+  local text = read_file(LOG_FILE) or ""
+  if #text > 150000 then text = "...(older lines left out)\n" .. text:sub(-150000) end
+  local url, why = upload("Quarry log (" .. VERSION .. "), lanes: " .. #sorted_lanes() .. "\n" .. text)
+  if url then
+    add_log("control", "ALL LOGS: " .. url .. "  <- send this address")
+    local h = fs.open("logs_url.txt", "w")
+    h.writeLine(url)
+    h.close()
+  else
+    add_log("control", "Couldn't upload the log: " .. tostring(why))
+  end
+  draw_all(true)
+end
+
+-- Wakes up for a redraw the throttle held back, and otherwise every 15 s:
+-- to refresh the clocks on the dashboard, and to send "stop" again to a
+-- lane that hasn't said it's heading home.
+local function maintenance_loop()
+  local timer = os.startTimer(15)
+  local redraw_timer
+  while true do
+    local ev = { os.pullEvent() }
+    if ev[1] == "redraw" and not redraw_timer then
+      redraw_timer = os.startTimer(1)
+    elseif ev[1] == "timer" and ev[2] == log_timer then
+      log_timer = nil
+      upload_quarry_log()
+    elseif ev[1] == "timer" and ev[2] == redraw_timer then
+      redraw_timer = nil
+      draw_all(false)
+    elseif ev[1] == "timer" and ev[2] == timer then
+      timer = os.startTimer(started and 15 or 60) -- (between runs: once a minute)
+      if started and (stop_requested or finished) then
+        for lane, m in pairs(miners) do
+          if stopped[lane] and not m.stop_heard and not (m.home and m.confirmed)
+              and os.clock() - (m.stop_sent or 0) >= 120 then
+            tell_stop(lane)
+          end
+        end
+      end
+      draw_all(false)
+    end
+  end
+end
+
+local function run_update()
+  add_log("control", "Downloading the newest programs from GitHub...")
+  draw_all(true)
+  local ok, err = download_update()
+  term.clear()
+  forget_screen(term)
+  if not ok then
+    add_log("control", err)
+  elseif started then
+    add_log("control", "Update downloaded: it installs when this run is over.")
+  else
+    add_log("control", "Update downloaded: installing and restarting everything...")
+    draw_all(true)
+    apply_update()
+  end
+end
+
+-- SAVE on the settings panel (same as answering the questions after C).
+local function save_settings()
+  chunks = math.max(0, panel.chunks)
+  write_progress(math.max(0, panel.mined))
+  skip = read_progress()
+  local f = fs.open(SETTINGS_FILE, "w")
+  f.write(length .. "\n0\n" .. chunks .. "\n")
+  f.close()
+  save_run()
+  add_log("control", string.format("Settings saved: %s, %d mined before (driven past).",
+    chunks == 0 and "until stopped" or (chunks .. " chunks"), skip))
+end
+
+local function touched(name)
+  if name == "start" then
+    panel = nil
+    do_start()
+  elseif name == "stop" then
+    confirm_stop_until = os.clock() + 5
+  elseif name == "confirm_stop" then
+    confirm_stop_until = 0
+    do_stop()
+  elseif name == "update" then
+    confirm_update_until = os.clock() + 5
+  elseif name == "confirm_update" then
+    confirm_update_until = 0
+    run_update()
+  elseif name == "logs" then
+    collect_logs()
+  elseif name == "settings" and not started then
+    if panel then
+      panel = nil
+    else
+      panel = { chunks = chunks, mined = read_progress() }
+    end
+  elseif name == "cancel" then
+    panel = nil
+  elseif name == "save" and panel then
+    save_settings()
+    panel = nil
+  elseif panel then
+    local key, amount = name:match("^([cm])([%-%+]%d+)$")
+    if key == "c" then panel.chunks = math.max(0, panel.chunks + tonumber(amount)) end
+    if key == "m" then panel.mined = math.max(0, panel.mined + tonumber(amount)) end
+  end
+end
+
+local function ui_loop()
+  while true do
+    local ev = { os.pullEvent() }
+    local e = ev[1]
+    if e == "key" then
+      if ev[2] == keys.enter then
+        do_start()
+      elseif ev[2] == keys.s then
+        do_stop()
+      elseif ev[2] == keys.q and (not started or all_stopped()) then
+        return
+      elseif ev[2] == keys.u then
+        run_update()
+      elseif ev[2] == keys.l then
+        collect_logs()
+      elseif ev[2] == keys.c and not started then
+        local h = fs.open(ASK_FILE, "w")
+        h.write("ask for the settings on the next boot\n")
+        h.close()
+        os.reboot()
+      end
+      draw_all(true)
+    elseif e == "monitor_touch" then
+      local x, y = ev[3], ev[4]
+      for _, b in ipairs(buttons) do
+        if y >= b.y and y <= (b.y2 or b.y) and x >= b.x1 and x <= b.x2 then
+          touched(b.name)
+          break
+        end
+      end
+      draw_all(true)
+    elseif e == "monitor_resize" or e == "peripheral" or e == "peripheral_detach" then
+      find_monitor()
+      draw_all(true)
+    end
+  end
+end
+
+find_monitor()
+deploy_log = function(text) add_log("control", text) end
+if update_staged() and not (resumed and started) then
+  add_log("control", "Installing the downloaded update...")
+  draw_all(true)
+  apply_update()
+end
+if resumed and started then
+  add_log("control", "Restarted: resuming the run at chunk " .. current_chunk .. ".")
+  check_all_home()
+elseif resumed then
+  add_log("control", "Restarted: kept the lanes registered before the restart.")
+else
+  add_log("control", string.format("Controller ready (down to bedrock, %s, %d mined before). Waiting for lanes.",
+    chunks == 0 and "until stopped" or (chunks .. " chunks"), read_progress()))
+end
+if not mon then add_log("control", "No monitor found - attach an Advanced Monitor for the dashboard.") end
+term.clear()
+forget_screen(term)
+draw_all(true)
+-- Turtles keep quiet between runs: ask who's out there (we may have been
+-- restarted on our own, with nobody saying hello since).
+queue_send(nil, { cmd = "who" }, PROTOCOL)
+parallel.waitForAny(network_loop, ui_loop, deploy_server, sender_loop, maintenance_loop)
+draw_all(true)
+
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+forget_screen(term)
+term.setCursorPos(1, 1)
+if started and not all_stopped() then
+  print("Controller closed in the middle of a run. Run it")
+  print("again to carry on (the run is saved).")
+else
+  print("Controller closed. Run it again for the next run.")
+end
+print("Log saved in " .. LOG_FILE .. " (view it with: edit " .. LOG_FILE .. ")")

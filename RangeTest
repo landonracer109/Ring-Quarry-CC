@@ -1,0 +1,90 @@
+-- rangetest (ComputerCraft 1.63) -- does a wireless modem up high reach
+-- turtles far away and deep down? Two computers with wireless modems:
+--
+--   rangetest listen <y>   on the computer up high (<y> = its height, from
+--                          F3, only used to show the range it should have)
+--   rangetest ping         on a turtle / pocket computer you carry around:
+--                          asks every 2 s and shows whether the answer came
+--
+-- Uses its own modem channel (not rednet), so it can't disturb the quarry.
+-- At most one message every 2 s each way. Stop with Ctrl+T.
+
+local CHANNEL, REPLY = 4242, 4243
+local mode, arg_y = ...
+
+local modem
+for _, side in ipairs(rs.getSides()) do
+  if peripheral.getType(side) == "modem" then
+    local m = peripheral.wrap(side)
+    if not m.isWireless or m.isWireless() then modem = m break end
+  end
+end
+if not modem then
+  print("No wireless modem attached!")
+  return
+end
+
+-- the range CC gives a modem at height y (your server's settings)
+local function expected(y)
+  local lo, hi = 64, 384
+  if y and y > 96 then return math.floor(lo + (y - 96) * (hi - lo) / (255 - 96)) end
+  return lo
+end
+
+if mode == "listen" then
+  local y = tonumber(arg_y)
+  modem.open(CHANNEL)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("Range test: LISTENING (Ctrl+T to stop)")
+  if y then
+    print("At y=" .. y .. ": should reach about " .. expected(y) .. " blocks")
+    print("(in a thunderstorm much less)")
+  end
+  print("")
+  local count = 0
+  while true do
+    local ev, side, ch, reply, msg, dist = os.pullEvent("modem_message")
+    if ch == CHANNEL and type(msg) == "table" and msg.rangetest == "ping" then
+      count = count + 1
+      print(string.format("#%d ping from computer %s, %d blocks away",
+        count, tostring(msg.id), math.floor((dist or 0) + 0.5)))
+      modem.transmit(REPLY, CHANNEL, { rangetest = "pong", n = msg.n, y = y })
+    end
+  end
+
+elseif mode == "ping" then
+  modem.open(REPLY)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("Range test: PINGING every 2 s (Ctrl+T to stop)")
+  print("Move around; check F3 for where you are.")
+  print("")
+  local n, got = 0, 0
+  while true do
+    n = n + 1
+    modem.transmit(CHANNEL, REPLY, { rangetest = "ping", n = n, id = os.getComputerID() })
+    local timer = os.startTimer(2)
+    local answer
+    while true do
+      local ev = { os.pullEvent() }
+      if ev[1] == "timer" and ev[2] == timer then break end
+      if ev[1] == "modem_message" and ev[3] == REPLY and type(ev[5]) == "table"
+          and ev[5].rangetest == "pong" and ev[5].n == n then
+        answer = ev
+      end
+    end
+    if answer then
+      got = got + 1
+      print(string.format("#%d OK   reached, %d blocks away (%d of %d)",
+        n, math.floor((answer[6] or 0) + 0.5), got, n))
+    else
+      print(string.format("#%d ---  no answer (%d of %d)", n, got, n))
+    end
+  end
+
+else
+  print("Usage:")
+  print("  rangetest listen <y>   (on the high computer)")
+  print("  rangetest ping         (on the one you carry)")
+end

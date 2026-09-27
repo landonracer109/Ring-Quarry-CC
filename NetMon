@@ -1,0 +1,263 @@
+-- netmon (ComputerCraft 1.63) -- live count of the rednet messages around
+-- it. Stand-alone: it only LISTENS (sends nothing), so it adds no load.
+--
+-- CC's rednet sends a copy of every message on the "repeat" channel 65533
+-- (for repeaters). netmon listens there, so it hears every rednet message
+-- within wireless range: put it up high (like the quarry's main computer)
+-- to hear the whole quarry.
+--
+-- Shows on its own screen and on any monitor attached (next to it, or
+-- through wired modems). Keys: R = reset the counts, Q = quit.
+
+local REPEAT = 65533
+local WINDOW = 300 -- seconds of history kept for "last 5 min"
+
+local modem
+for _, side in ipairs(rs.getSides()) do
+  if peripheral.getType(side) == "modem" then
+    local m = peripheral.wrap(side)
+    if not m.isWireless or m.isWireless() then modem = m break end
+  end
+end
+if not modem then
+  print("No wireless modem attached!")
+  return
+end
+modem.open(REPEAT)
+
+local mon
+for _, name in ipairs(peripheral.getNames()) do
+  if peripheral.getType(name) == "monitor" then mon = peripheral.wrap(name) break end
+end
+if mon then
+  for _, sc in ipairs({ 1, 0.5 }) do
+    mon.setTextScale(sc)
+    local w, h = mon.getSize()
+    if w >= 50 and h >= 20 then break end
+  end
+end
+
+local events    -- { t=, from=, kind= }, newest last, only the last WINDOW s
+local names     -- [computer id] = "lane 3", "service", "main computer", ...
+local total, started, peak, peak_at, second_counts
+local log -- the last messages, newest last: { t=, from=, to=, kind=, detail= }
+local LOG_MAX = 100
+local function reset()
+  events, names, total, peak, peak_at, log = {}, {}, 0, 0, nil, {}
+  second_counts = {} -- [whole second] = messages in it
+  started = os.clock()
+end
+reset()
+
+-- what kind of message (and who sent it), from what's inside
+local function describe(from, msg, proto)
+  local kind = tostring(proto or "rednet")
+  if type(msg) == "table" then
+    if msg.cmd then kind = tostring(msg.cmd) end
+    if msg.cmd == "status" and type(msg.id) == "number" then
+      names[from] = "lane " .. msg.id
+    elseif msg.cmd == "service" then
+      names[from] = "service"
+    elseif msg.cmd == "service_request" and type(msg.id) == "number" then
+      names[from] = "lane " .. msg.id
+    elseif (msg.cmd == "ack" or msg.cmd == "serviced") and proto == "chunkservice" then
+      names[from] = "service"
+    elseif msg.cmd == "stop" or msg.cmd == "next_chunk" or msg.cmd == "registered"
+        or msg.cmd == "start" or msg.cmd == "who" or msg.cmd == "collect" then
+      names[from] = "main computer"
+    end
+  end
+  return kind
+end
+
+local function detail_of(msg)
+  if type(msg) ~= "table" then return tostring(msg):sub(1, 40) end
+  if msg.state then return tostring(msg.state) end
+  if type(msg.texts) == "table" and msg.texts[1] then return tostring(msg.texts[1]) end
+  if msg.chunk then return "chunk " .. tostring(msg.chunk) end
+  if msg.id then return "lane " .. tostring(msg.id) end
+  return ""
+end
+
+local function fmt_time(sec)
+  sec = math.floor(sec)
+  return string.format("%d:%02d:%02d", math.floor(sec / 3600), math.floor(sec / 60) % 60, sec % 60)
+end
+
+local function pad(s, n)
+  s = tostring(s)
+  if #s >= n then return s:sub(1, n) end
+  return s .. string.rep(" ", n - #s)
+end
+
+-- "0.19/s": CC 1.63's string.format ignores "%.2f", so round by hand
+local function rate(x)
+  local n = math.floor(x * 100 + 0.5)
+  return string.format("%d.%02d/s", math.floor(n / 100), n % 100)
+end
+
+-- Only lines that changed are written (and nothing is cleared), so a
+-- quiet screen costs next to nothing.
+local shown = {} -- [screen] = { [y] = text .. color }
+local function draw(t)
+  local w, h = t.getSize()
+  local now = os.clock()
+  local sec = math.floor(now)
+  local cache = shown[t]
+  if not cache or cache.w ~= w or cache.h ~= h then
+    t.setBackgroundColor(colors.black)
+    t.clear()
+    cache = { w = w, h = h }
+    shown[t] = cache
+  end
+  local y = 1
+  local function line(text, color)
+    if y > h then return end
+    text = pad(text, w)
+    local key = text .. tostring(color)
+    if cache[y] ~= key then
+      cache[y] = key
+      t.setCursorPos(1, y)
+      if t.isColor() then t.setTextColor(color or colors.white) end
+      t.setBackgroundColor(colors.black)
+      t.write(text)
+    end
+    y = y + 1
+  end
+
+  -- counts over the windows
+  local last_sec, last_min, last_5 = 0, 0, #events
+  for _, e in ipairs(events) do
+    if e.t >= now - 1 then last_sec = last_sec + 1 end
+    if e.t >= now - 60 then last_min = last_min + 1 end
+  end
+  -- (rates over the time we've actually been listening, up to 5 min)
+  local span = math.max(1, math.min(WINDOW, now - started))
+  local busy = 0 -- seconds in the last 5 min with more than 2 messages
+  for s, n in pairs(second_counts) do if n > 2 then busy = busy + 1 end end
+
+  line(" NETWORK MONITOR  (rednet calls heard)", colors.yellow)
+  line(" running " .. fmt_time(now - started) .. "   R = reset, Q = quit", colors.gray)
+  line("")
+  line(" last second: " .. last_sec .. "    last minute: " .. rate(last_min / 60),
+    last_sec > 1 and colors.orange or colors.lime)
+  line(" last 5 min:  " .. rate(last_5 / span) .. "    total: " .. total)
+  line(string.format(" busiest second: %d%s   seconds >2 (5 min): %d", peak,
+    peak_at and ("  (" .. fmt_time(peak_at - started) .. " in)") or "", busy),
+    peak > 2 and colors.orange or colors.white)
+  line("")
+
+  -- the last 60 s as a bar per second
+  local chart_w = math.min(60, w - 2)
+  local bars = {}
+  for i = chart_w - 1, 0, -1 do
+    local n = second_counts[sec - i] or 0
+    bars[#bars + 1] = n == 0 and "." or (n < 10 and tostring(n) or "+")
+  end
+  line(" last " .. chart_w .. " s (messages per second, newest right):", colors.gray)
+  line(" " .. table.concat(bars), colors.lightBlue)
+  line("")
+
+  -- by computer and by kind, over the last 5 min
+  local by_from, by_kind = {}, {}
+  for _, e in ipairs(events) do
+    by_from[e.from] = (by_from[e.from] or 0) + 1
+    by_kind[e.kind] = (by_kind[e.kind] or 0) + 1
+  end
+  local function sorted(tab)
+    local list = {}
+    for k, n in pairs(tab) do list[#list + 1] = { k, n } end
+    table.sort(list, function(a, b) return a[2] > b[2] end)
+    return list
+  end
+  local froms, kinds = sorted(by_from), sorted(by_kind)
+  local col = math.floor(w / 2)
+  line(pad(" BY COMPUTER (5 min)", col) .. " BY KIND (5 min)", colors.yellow)
+  for i = 1, math.min(6, math.max(#froms, #kinds)) do
+    if y > h then break end
+    local left, right = "", ""
+    if froms[i] then
+      local id = froms[i][1]
+      left = " " .. pad((names[id] or "?") .. " #" .. id, 18) .. rate(froms[i][2] / span)
+    end
+    if kinds[i] then
+      right = " " .. pad(kinds[i][1], 17) .. rate(kinds[i][2] / span)
+    end
+    line(pad(left, col) .. right)
+  end
+  -- the log: the latest messages, newest at the bottom
+  line("")
+  line(" LOG (newest at the bottom)", colors.yellow)
+  local rows = h - y + 1
+  -- (short, so the detail at the end still fits)
+  local function who(id)
+    if id == 65535 then return "all" end
+    local name = names[id]
+    if name == "main computer" then return "main" end
+    return name or ("#" .. tostring(id))
+  end
+  -- (a wider monitor gets wider name / kind columns)
+  local nw, kw = 9, 12
+  if w >= 70 then nw, kw = 14, 16 end
+  for i = math.max(1, #log - rows + 1), #log do
+    local e = log[i]
+    local sec = math.floor(e.t - started)
+    local stamp = string.format("%d:%02d", math.floor(sec / 60), sec % 60)
+    line(" " .. pad(stamp, 6) .. pad(who(e.from), nw) .. "> " .. pad(who(e.to), nw - 1)
+      .. pad(e.kind, kw) .. " " .. e.detail,
+      names[e.from] and colors.white or colors.lightGray)
+  end
+  while y <= h do line("") end -- (clear what's left from before)
+end
+
+local function redraw()
+  draw(term)
+  if mon then pcall(draw, mon) end
+end
+
+local REFRESH = 2 -- seconds between redraws
+local timer = os.startTimer(REFRESH)
+redraw()
+while true do
+  local ev = { os.pullEvent() }
+  if ev[1] == "modem_message" and ev[3] == REPEAT then
+    local packet = ev[5]
+    if type(packet) == "table" and packet.nMessageID then
+      local now = os.clock()
+      local from = ev[4] -- (rednet puts the sender's ID as the reply channel)
+      local kind = describe(from, packet.message, packet.sProtocol)
+      table.insert(events, { t = now, from = from, kind = kind })
+      table.insert(log, { t = now, from = from, to = packet.nRecipient, kind = kind,
+        detail = detail_of(packet.message) })
+      if #log > LOG_MAX then table.remove(log, 1) end
+      total = total + 1
+      local s = math.floor(now)
+      second_counts[s] = (second_counts[s] or 0) + 1
+      if second_counts[s] > peak then peak, peak_at = second_counts[s], now end
+    end
+  elseif ev[1] == "timer" and ev[2] == timer then
+    local now = os.clock()
+    while events[1] and events[1].t < now - WINDOW do table.remove(events, 1) end
+    -- (collect first, delete after: CC 1.63 can't delete while looping)
+    local old = {}
+    for s in pairs(second_counts) do
+      if s < now - WINDOW then old[#old + 1] = s end
+    end
+    for _, s in ipairs(old) do second_counts[s] = nil end
+    redraw()
+    timer = os.startTimer(REFRESH)
+  elseif ev[1] == "key" then
+    if ev[2] == keys.q then break end
+    if ev[2] == keys.r then reset() shown = {} redraw() end
+  elseif ev[1] == "peripheral" or ev[1] == "peripheral_detach" then
+    mon = nil
+    for _, name in ipairs(peripheral.getNames()) do
+      if peripheral.getType(name) == "monitor" then mon = peripheral.wrap(name) break end
+    end
+  end
+end
+term.setBackgroundColor(colors.black)
+term.setTextColor(colors.white)
+term.clear()
+term.setCursorPos(1, 1)
+print("netmon stopped.")

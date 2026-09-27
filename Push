@@ -1,0 +1,51 @@
+-- push (ComputerCraft 1.63) -- uploads text files and prints a web address
+-- to share (pastebin's old API no longer works). No account needed.
+-- Usage: push <file> [more files...]
+--   e.g. push quarry.log      push .quarry_debug_a .quarry_debug_b
+
+local files = { ... }
+if #files == 0 then
+  print("Usage: push <file> [more files...]")
+  return
+end
+if not http then
+  print("HTTP is turned off on this server, so nothing can be uploaded.")
+  return
+end
+
+local text = ""
+for _, name in ipairs(files) do
+  local path = shell.resolve(name)
+  if not fs.exists(path) or fs.isDir(path) then
+    print("No such file: " .. name)
+    return
+  end
+  local h = fs.open(path, "r")
+  local body = h.readAll() or ""
+  h.close()
+  if #files > 1 then text = text .. "== " .. name .. "\n" end
+  text = text .. body .. "\n"
+end
+
+print("Uploading " .. #text .. " characters...")
+local r = http.post("https://paste.rs/", text)
+local url
+if r then
+  url = (r.readAll() or ""):match("https?://%S+")
+  r.close()
+end
+if not url then
+  r = http.post("https://dpaste.com/api/v2/",
+    "expiry_days=30&content=" .. textutils.urlEncode(text))
+  if r then
+    url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then url = url .. ".txt" end
+  end
+end
+if url then
+  print("Uploaded. Share this address:")
+  print(url)
+else
+  print("Upload failed: paste.rs and dpaste.com both refused (blocked by the server?)")
+end
