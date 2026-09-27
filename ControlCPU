@@ -70,7 +70,7 @@ end
 local DEPLOY_PROTOCOL = "chunkdeploy"
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "R1"
+local VERSION = "R2"
 
 local REPO = "https://raw.githubusercontent.com/landonracer109/Ring-Quarry-CC/"
 local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
@@ -628,6 +628,7 @@ end
 
 local function lane_progress(lane)
   local m = miners[lane]
+  if current_chunk == 0 and not all_home then return 0 end
   if all_home or (done[lane] or 0) >= current_chunk then return 1 end
   local c = plan[current_chunk]
   if c and m.chunk == ckey(c.a, c.b) and m.pass and passes() then
@@ -1313,6 +1314,7 @@ local function handle(sender, msg)
       miners[lane].id = sender
       miners[lane].status = "registered"
       miners[lane].seen = os.clock()
+      miners[lane].ver = msg.ver or miners[lane].ver
       if changed or not msg.registered then send(lane, { cmd = "registered", id = lane }) end
       if changed then save_run() end
     elseif not m and not finished and not stop_requested then
