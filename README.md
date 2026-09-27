@@ -160,9 +160,11 @@ Dashboard buttons (bottom row of the monitor), or keys on the main computer:
 | UPD | U | download the newest programs from GitHub; they install between runs and every turtle reboots onto them (touch twice) |
 | LOG | L | every turtle uploads its debug log; the main computer shows one link to all of them |
 
-- The **map** next to the service panel shows the rings: `#` mined,
-  `@` being mined, `C` the control chunk, `.` still to do. Finished chunks
-  are remembered in `quarry.map` on the main computer.
+- The **map** beside the service panel and log shows the rings in colored
+  blocks, as big as fit: green = mined, yellow `@` = being mined, blue `C`
+  = the control chunk, gray = still to do. On a small monitor or with many
+  rings it shrinks to one character per chunk (`#`, `@`, `C`, `.`).
+  Finished chunks are remembered in `quarry.map` on the main computer.
 - The **VER** column shows each turtle's program version: red means it
   hasn't taken the newest update yet.
 - If a turtle says **LOST**, put it on its start spot and run
