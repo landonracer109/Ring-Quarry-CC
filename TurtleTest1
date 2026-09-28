@@ -52,7 +52,7 @@ end
 
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "R4"
+local VERSION = "R5"
 
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
@@ -840,6 +840,13 @@ end
 -- ground instead (lane 0 with loaders: nobody else ever goes up there, so
 -- it can't meet a turtle waiting at the spot below it).
 local SKY = 2
+-- Flying: above the ground we can also cross chunks that are loaded but not
+-- mined yet (the chunk being mined, ring 1), which can cut a trip home from
+-- all the way around a ring to a chunk or two. Each lane flies at its own
+-- height (above cacti and most trees; anything in the way is dug).
+local FLY_BASE = 8
+local function fly_height() return FLY_BASE + LANE end
+
 local function travel_to(te, tn, ty, tf, open, sky)
   open = open or S.open
   if S.e == te and S.n == tn then -- (already there: just up or down)
@@ -851,11 +858,26 @@ local function travel_to(te, tn, ty, tf, open, sky)
   local a1, b1 = chunk_of(S.e, S.n)
   local a2, b2 = chunk_of(te, tn)
   local path = chunk_path(a1, b1, a2, b2, open)
+  local fly = false
+  if not sky then
+    local air = {} -- (chunks we can fly over: loaded ones)
+    for k in pairs(open or {}) do air[k] = true end
+    if S.job then air[ckey(S.job.a, S.job.b)] = true end
+    for a = -1, 1 do
+      for b = -1, 1 do
+        if a ~= 0 or b ~= 0 then air[ckey(a, b)] = true end -- (ring 1: always loaded)
+      end
+    end
+    local fpath = chunk_path(a1, b1, a2, b2, air)
+    -- (up in the air over a chunk that isn't mined: we must fly on)
+    local must = S.y > 0 and not is_open(open, a1, b1)
+    if fpath and (not path or must or #fpath < #path) then path, fly = fpath, true end
+  end
   if not path then
     lost("No way from chunk " .. ckey(a1, b1) .. " to chunk " .. ckey(a2, b2) .. " through mined-out chunks.")
   end
   S.traveling = true
-  local h = sky and SKY or travel_depth()
+  local h = sky and SKY or (fly and fly_height() or travel_depth())
   for _ = 1, 4 do
     local ok, why = go_to_y(h)
     if ok then break end
@@ -937,9 +959,9 @@ end
 function burn_fuel()
   local marked = false
   for i = 1, 16 do
-    -- room for a whole coal block (800): burning one into a nearly full tank
-    -- would waste most of it (the service turtle hands over only what fits)
-    if fuel_limit() - fuel_level() < 800 then break end
+    -- room for one piece of coal (80). A coal block only ever comes from
+    -- the service turtle, which hands over just what fits.
+    if fuel_limit() - fuel_level() < 80 then break end
     if is_cargo(i) and turtle.getItemCount(i) > 0 then
       -- A restart in the middle of burning leaves our fuel above our
       -- notes: this tells it apart from a server crash (see start_run).
@@ -1245,6 +1267,7 @@ local function request_service(label, why)
 
   while true do
   compact_cargo() -- (also: no point carrying junk to the service turtle)
+  burn_fuel() -- (mined coal first: the fuel we report must be right)
   -- nothing left to unload once the junk is out, and fuel enough: no need
   -- to call (the service turtle doesn't answer a request with nothing in it)
   if stacks_for_service() == 0 and fuel_level() >= need then break end
@@ -1326,7 +1349,9 @@ end
 local function ensure_ok()
   local unload = false
   if inventory_nearly_full() then
-    dump_junk()
+    -- junk out, split stacks merged (CC doesn't always put a dug block on
+    -- its stack), mined coal burned: then see if we still need to go home
+    compact_cargo()
     burn_fuel() -- coal we mined: as much as fits in the tank, freeing slots
     unload = free_cargo_slots() < FREE_AFTER_DUMP
   elseif fuel_level() < fuel_needed() then

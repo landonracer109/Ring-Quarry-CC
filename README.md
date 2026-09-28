@@ -28,7 +28,11 @@ to the base, so trips home stay short and the radio always reaches.
   carries, so trips home are rare.
 - **Going home**: a miner that's nearly full or low on fuel drives back to
   its start spot, each lane at its own depth underground so they never meet.
-  The **service turtle** pulls out its blocks and refuels it.
+  When it's shorter, it **flies** instead, 8 to 23 blocks up (each lane its
+  own height), over chunks that are loaded but not mined yet, like the one
+  being mined. The **service turtle** pulls out its blocks and refuels it.
+  Before heading home a miner throws out junk, merges split stacks and
+  burns the coal it mined, so it only goes when it really is full.
 - **Chunk loading**: ring 1 sits in the always-loaded area around the base.
   From ring 2 on, lane 0 places a **Spot Loader** for each chunk, takes a
   finished ring's loaders back when the next ring starts, and collects them
