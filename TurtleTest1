@@ -52,7 +52,7 @@ end
 
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "R3"
+local VERSION = "R4"
 
 -- Our program's checksum, so the main computer can spot a turtle running an
 -- old version between runs. Only when we were started by the boot loader
@@ -439,6 +439,14 @@ local SIDE = { f = "front", b = "back", u = "top", d = "bottom" }
 local MOVE = { f = turtle.forward, b = turtle.back, u = turtle.up, d = turtle.down }
 local DIG = { f = turtle.dig, u = turtle.digUp, d = turtle.digDown }
 local DETECT = { f = turtle.detect, u = turtle.detectUp, d = turtle.detectDown }
+local ATTACK = { f = turtle.attack, u = turtle.attackUp, d = turtle.attackDown }
+-- A mob parked in our way: we can't tell a mob from a PLAYER, so we only
+-- ever swing when it's been in the way this long, this deep down (players
+-- walk the surface, the home row and the tunnels), and never while
+-- travelling between chunks.
+local ATTACK_AFTER = 60 -- seconds blocked
+local ATTACK_DEPTH = 5  -- layers below the surface
+local ATTACK_HITS = 3   -- swings per minute of being blocked
 local COMPARE = { f = turtle.compare, u = turtle.compareUp, d = turtle.compareDown }
 
 -- Lane 0 never digs a Spot Loader by accident (only when collecting it):
@@ -509,6 +517,7 @@ local lost -- (defined at the end)
 -- when something can't be dug.
 local function step(dir)
   local failed, digs, waits, warned = 0, 0, 0, false
+  local blocked_since
   while true do
     local te, ty, tn = target(dir)
     if protected(te, tn) then
@@ -519,6 +528,19 @@ local function step(dir)
       return true
     end
     if turtle.getFuelLevel() == 0 then wait_for_fuel() end
+    if dir == "f" and S.check_facing then
+      local near = false
+      for f = 0, 3 do
+        if protected(S.e + STEP[f][1], S.n + STEP[f][2]) then near = true end
+      end
+      if near then
+        local want = S.f
+        if not find_facing() then
+          lost("Next to a protected spot and I can't tell which way I face.")
+        end
+        turn_to(want)
+      end
+    end
     if dir == "f" and S.check_facing and DETECT[dir]() then
       -- (the way the caller meant: turn there for real once we know)
       local want = S.f
@@ -551,6 +573,20 @@ local function step(dir)
         say("Something is in my way. Waiting for it to move...", "blocked")
         debug("(moving " .. dir .. " facing " .. S.f .. " to " .. te .. " " .. ty .. " " .. tn .. ")")
         warned = true
+        blocked_since = os.clock()
+      end
+      if ATTACK[dir] and os.clock() - blocked_since >= ATTACK_AFTER
+          and S.y <= -ATTACK_DEPTH and not S.traveling and not is_turtle(dir) then
+        local hits = 0
+        for _ = 1, ATTACK_HITS do
+          if not ATTACK[dir]() then break end
+          hits = hits + 1
+          sleep(0.5)
+        end
+        if hits > 0 then
+          say("A mob was in my way at y=" .. S.y .. ": attacked it (" .. hits .. " hits).")
+        end
+        blocked_since = os.clock() -- (the next swings a minute from now)
       end
       sleep(math.min(1 + waits, 10))
       waits = waits + 1
@@ -649,13 +685,14 @@ local function facing_from(de, dn)
   end
 end
 
-local function probe_facing()
+local function probe_facing(anywhere)
   local bf = S.f -- (the way we think we face: no test step into a protected
-  -- spot. The test step never digs, so if we're wrong it's only into air.)
+  -- spot. The test step never digs, so if we're wrong it's only into air.
+  -- anywhere: below the surface, where protected spots are solid rock)
   for _ = 1, 4 do
     local e, _, n = gps_here()
     if not e then return false end
-    if not protected(S.e + STEP[bf][1], S.n + STEP[bf][2]) and turtle.forward() then
+    if (anywhere or not protected(S.e + STEP[bf][1], S.n + STEP[bf][2])) and turtle.forward() then
       local e2, _, n2 = gps_here()
       if not turtle.back() and e2 then
         S.e, S.n = e2, n2 -- (someone came in behind us: we stay here)
@@ -687,7 +724,7 @@ function find_facing()
   -- Next to a protected spot: protected spots are never dug, so below the
   -- surface they're solid and a test step can't go in. Look from there.
   local y0 = S.y
-  local ok = go_to_y(math.min(y0, -1)) and probe_facing()
+  local ok = go_to_y(math.min(y0, -1)) and probe_facing(true)
   if not ok then
     S.check_facing = true
     save()
@@ -900,9 +937,9 @@ end
 function burn_fuel()
   local marked = false
   for i = 1, 16 do
-    -- room for any fuel item (a coal block is 800, lava 1000): burning one
-    -- into a nearly full tank would waste most of it
-    if fuel_limit() - fuel_level() < 1000 then break end
+    -- room for a whole coal block (800): burning one into a nearly full tank
+    -- would waste most of it (the service turtle hands over only what fits)
+    if fuel_limit() - fuel_level() < 800 then break end
     if is_cargo(i) and turtle.getItemCount(i) > 0 then
       -- A restart in the middle of burning leaves our fuel above our
       -- notes: this tells it apart from a server crash (see start_run).

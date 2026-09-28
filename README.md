@@ -39,7 +39,11 @@ to the base, so trips home stay short and the radio always reaches.
 - **Light on the server**: about 0.5–0.7 radio messages a second for the
   whole quarry while mining (each turtle in its own time slot), nothing
   between runs.
-- **Turtles never attack.**
+- **Mobs in the way**: turtles can't tell a mob from a player, so they
+  wait. Only when something has blocked them for a full minute, 5 or more
+  layers down and not while travelling, do they swing at it (3 hits a
+  minute), and they log it. Near the surface, on the home row and in the
+  travel tunnels they never attack.
 
 ## What you need
 

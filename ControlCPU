@@ -70,7 +70,7 @@ end
 local DEPLOY_PROTOCOL = "chunkdeploy"
 -- Shown on the dashboard, so you can tell whether everything got updated.
 -- c, m and s carry the same number; it goes up with every change.
-local VERSION = "R3"
+local VERSION = "R4"
 
 local REPO = "https://raw.githubusercontent.com/landonracer109/Ring-Quarry-CC/"
 local FILES = { { "ControlCPU", "c" }, { "ServiceTurtle", "s" }, { "TurtleTest1", "m" } }
