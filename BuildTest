@@ -1,0 +1,211 @@
+-- buildtest (ComputerCraft 1.63) -- one-time check before we write the
+-- quarry builder. It tries each trick the builder needs and writes what
+-- happened to "buildtest.log". Afterwards: push buildtest.log
+--
+-- THE BUILDER: a turtle with a PICKAXE on one side and a NARCISSISTIC
+-- TURTLE upgrade (OpenPeripheral Addons) on the other. Some fuel (50+).
+--
+-- PUT IT in an open, flat spot, facing any way, with:
+--   * air: 1 block in front, 1 above, 1 above the front, 1 to its right,
+--     and 3 blocks to its LEFT in a row with 2 blocks of air above each
+--     (and the blocks beside those, on the side it faces)
+--   * a CHEST right BEHIND it, with a few different items in it
+--   * in its inventory, exactly these slots:
+--       1: one wireless mining turtle (a fresh one, never used)
+--       2: one computer (normal or advanced)
+--       3: two disk drives
+--       4: one floppy disk (blank)
+--       5: one wired modem
+--       6: one wireless modem
+--       7: two advanced monitors
+--       8: one more floppy disk (blank: floppies don't stack)
+--   * slots 9-16 empty
+-- Then run: buildtest
+-- Everything it places stays where it is (look at it, then break it).
+
+local LOG = "buildtest.log"
+if fs.exists(LOG) then fs.delete(LOG) end
+local function log(...)
+  local parts = {}
+  for i, v in ipairs({ ... }) do parts[i] = tostring(v) end
+  local line = table.concat(parts, " ")
+  print(line)
+  local f = fs.open(LOG, "a")
+  f.writeLine(line)
+  f.close()
+end
+
+local function methods(side)
+  local ok, m = pcall(peripheral.getMethods, side)
+  if ok and m then return table.concat(m, ",") end
+  return "-"
+end
+
+local function slot_for()
+  for i = 9, 16 do
+    if turtle.getItemCount(i) == 0 then return i end
+  end
+end
+
+log("== buildtest, turtle #" .. os.getComputerID() .. ", fuel " .. tostring(turtle.getFuelLevel()))
+if type(turtle.getFuelLevel()) == "number" and turtle.getFuelLevel() < 40 then
+  log("Not enough fuel: put some fuel in and refuel first.")
+  return
+end
+for i = 1, 8 do log("slot " .. i .. ": " .. turtle.getItemCount(i) .. " items") end
+
+-- 1. What can it see? (the Narcissistic upgrade, the chest behind)
+log("-- 1. peripherals around the builder")
+for _, side in ipairs(rs.getSides()) do
+  local t = peripheral.getType(side)
+  if t then log(side .. ": " .. t .. "  methods: " .. methods(side)) end
+end
+local self_inv
+for _, side in ipairs({ "left", "right" }) do
+  local m = methods(side)
+  if m:find("getAllStacks") or m:find("getStackInSlot") then self_inv = side end
+end
+if self_inv then
+  local ok, stacks = pcall(peripheral.call, self_inv, "getAllStacks")
+  log("own inventory (" .. self_inv .. "): ok=" .. tostring(ok))
+  if ok and type(stacks) == "table" then
+    for slot, st in pairs(stacks) do log("  slot " .. tostring(slot) .. ": " .. textutils.serialize(st)) end
+  else
+    log("  " .. tostring(stacks))
+    for i = 1, 8 do
+      local ok2, st = pcall(peripheral.call, self_inv, "getStackInSlot", i)
+      log("  getStackInSlot(" .. i .. "): " .. tostring(ok2) .. " " .. textutils.serialize(st))
+    end
+  end
+else
+  log("NO Narcissistic upgrade found on left or right")
+end
+if peripheral.getType("back") then
+  local ok, stacks = pcall(peripheral.call, "back", "getAllStacks")
+  log("chest behind: ok=" .. tostring(ok))
+  if ok and type(stacks) == "table" then
+    for slot, st in pairs(stacks) do log("  slot " .. tostring(slot) .. ": " .. textutils.serialize(st)) end
+  else
+    log("  " .. tostring(stacks))
+  end
+else
+  log("nothing readable behind (no chest, or OpenPeripheral doesn't wrap it)")
+end
+
+-- 2. Write two floppies: a disk drive on our right, floppy in, write, out.
+log("-- 2. preparing two floppies")
+local REPORT = [[
+-- (written by buildtest) runs by itself when this computer/turtle boots
+local f = fs.open(fs.getDir(shell.getRunningProgram()) .. "/NAME", "w")
+f.writeLine("id " .. os.getComputerID() .. " running " .. tostring(shell.getRunningProgram()))
+for _, side in ipairs(rs.getSides()) do
+  f.writeLine(side .. ": " .. tostring(peripheral.getType(side)))
+end
+if turtle then f.writeLine("fuel " .. tostring(turtle.getFuelLevel())) end
+f.close()
+os.shutdown()
+]]
+turtle.turnRight()
+turtle.select(3)
+log("place disk drive: " .. tostring(turtle.place()))
+local prepared = {}
+for n = 1, 2 do
+  turtle.select(n == 1 and 4 or 8)
+  log("floppy " .. n .. " into the drive: " .. tostring(turtle.drop(1)))
+  sleep(1)
+  local path = disk.getMountPath("front")
+  log("  mounted at " .. tostring(path))
+  if path then
+    local name = (n == 1) and "tresult.txt" or "cresult.txt"
+    local text = REPORT:gsub("NAME", name)
+    local f = fs.open(path .. "/startup", "w")
+    f.write(text)
+    f.close()
+  end
+  local s = slot_for()
+  turtle.select(s)
+  log("  floppy back out: " .. tostring(turtle.suck()) .. " -> slot " .. s)
+  prepared[n] = s
+end
+turtle.select(3)
+log("dig the drive back: " .. tostring(turtle.dig()))
+turtle.turnLeft()
+
+-- 3. Place the mining turtle in front, a drive with floppy 1 on top of it,
+-- and turn it on.
+log("-- 3. placing a turtle")
+turtle.select(1)
+log("place turtle: " .. tostring(turtle.place()))
+log("front is now: " .. tostring(peripheral.getType("front")) .. "  methods: " .. methods("front"))
+log("up: " .. tostring(turtle.up()))
+turtle.select(3)
+log("place drive on top of it: " .. tostring(turtle.place()))
+turtle.select(prepared[1])
+log("floppy 1 into that drive: " .. tostring(turtle.drop()))
+log("down: " .. tostring(turtle.down()))
+local ok, err = pcall(peripheral.call, "front", "turnOn")
+log("turnOn the turtle: " .. tostring(ok) .. " " .. tostring(err))
+sleep(8)
+log("up: " .. tostring(turtle.up()))
+local p = disk.getMountPath("front")
+log("its report (drive mounted at " .. tostring(p) .. "):")
+if p and fs.exists(p .. "/tresult.txt") then
+  local f = fs.open(p .. "/tresult.txt", "r")
+  log(f.readAll())
+  f.close()
+else
+  log("  NO REPORT: it didn't run the floppy's startup (or didn't turn on)")
+end
+log("down: " .. tostring(turtle.down()))
+
+-- 4. A computer 2 blocks to our left, a wired modem placed between us and
+-- it, a drive with floppy 2 on its top; then from its far side, turn it on.
+log("-- 4. placing a computer and a modem")
+turtle.turnLeft()
+log("forward: " .. tostring(turtle.forward()))
+turtle.select(2)
+log("place computer: " .. tostring(turtle.place()))
+log("back: " .. tostring(turtle.back()))
+turtle.select(5)
+log("place wired modem (computer 1 beyond): " .. tostring(turtle.place()))
+log("front is now: " .. tostring(peripheral.getType("front")))
+log("up: " .. tostring(turtle.up()))
+log("forward: " .. tostring(turtle.forward()))
+turtle.select(3)
+log("place drive on top of the computer: " .. tostring(turtle.place()))
+turtle.select(prepared[2])
+log("floppy 2 into it: " .. tostring(turtle.drop()))
+log("up: " .. tostring(turtle.up()))
+log("forward: " .. tostring(turtle.forward()))
+log("forward: " .. tostring(turtle.forward()))
+log("down: " .. tostring(turtle.down()))
+log("down: " .. tostring(turtle.down()))
+turtle.turnRight()
+turtle.turnRight()
+log("front (should be the computer): " .. tostring(peripheral.getType("front")) .. "  methods: " .. methods("front"))
+ok, err = pcall(peripheral.call, "front", "turnOn")
+log("turnOn the computer: " .. tostring(ok) .. " " .. tostring(err))
+sleep(8)
+log("up: " .. tostring(turtle.up()))
+p = disk.getMountPath("front")
+log("its report (drive mounted at " .. tostring(p) .. "):")
+if p and fs.exists(p .. "/cresult.txt") then
+  local f = fs.open(p .. "/cresult.txt", "r")
+  log(f.readAll())
+  f.close()
+else
+  log("  NO REPORT: it didn't run the floppy's startup (or didn't turn on)")
+end
+
+-- 5. Two monitors on top of each other, beside us, for you to look at.
+log("-- 5. monitors")
+turtle.turnLeft()
+turtle.select(7)
+log("place monitor: " .. tostring(turtle.place()))
+log("up: " .. tostring(turtle.up()))
+log("place monitor: " .. tostring(turtle.place()))
+log("== done. Now: push buildtest.log")
+print("")
+print("Look at the two monitors: does their screen face")
+print("the builder, or away from it? And which way does the")
+print("mining turtle face (its front has the face)?")

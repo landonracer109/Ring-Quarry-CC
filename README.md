@@ -190,6 +190,7 @@ Dashboard buttons (bottom row of the monitor), or keys on the main computer:
 | Push | `push <file>` | uploads files and prints a link to share them |
 | NetMon | `netmon` | listen-only live count of radio messages (adds no load) |
 | RangeTest | `rangetest` | checks how far a wireless modem reaches |
+| BuildTest | `buildtest` | one-time in-game check for the (coming) builder turtle: placing turtles, computers, modems and monitors, booting them from a floppy |
 
 Turtles get their programs from the main computer, so only the main
 computer ever downloads from GitHub.
