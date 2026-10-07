@@ -1,0 +1,1586 @@
+-- quarry_turtle (mining turtle) -- ComputerCraft 1.63
+-- Usage: m <laneId>            run as lane <laneId> (0..15)
+--        m <laneId> install    also run automatically every time it boots
+--        m <laneId> here       forget an interrupted run ("I'm on my start
+--                              spot") -- only needed if it says it's LOST
+--
+-- Mines its own 1-wide lane of the current chunk, 3 layers per pass, all
+-- the way down to bedrock (found by digging straight down at the start of
+-- its first chunk; bedrock is flat, so the depth is kept). Each
+-- pass digs forward from the chunk entrance to the far end (digging above
+-- and below as it goes), then backs up to the entrance and drops 3 layers.
+-- Junk (whatever is in the sample slots: cobble, dirt, gravel) goes into
+-- a Trash Can it carries: placed in the mined-out space above it, filled,
+-- and dug back up. When it's still nearly full, or low on fuel even after
+-- burning the coal it mined, it drives home to its start spot and calls the
+-- service turtle, which pulls its blocks out from behind (the service
+-- turtle never leaves the home row).
+--
+-- SURVIVES SERVER RESTARTS: the turtle never turns, and it saves its
+-- position before every move. After a restart it compares its fuel with
+-- the saved value (every move costs exactly 1 fuel) to tell whether the
+-- last move happened, then carries on where it left off.
+--
+-- SETUP (per turtle):
+--   * 16 miners in a flush row, all facing the tunnel direction.
+--     Lane 0 is the LEFTMOST; lane numbers increase to the RIGHT
+--     (standing behind the turtles, looking the way they face).
+--   * Wireless modem on every turtle.
+--   * Slots 12, 13, 14: ONE cobblestone, ONE dirt, ONE gravel (samples of
+--     what to throw away). Slot 15: an Extra Utilities Trash Can. Without
+--     these it keeps everything (the dashboard says so).
+--   * Lane 0 only: Spot Loaders in slot 16, one per chunk. It picks them
+--     back up at the end of every run (finished or stopped), except chunk
+--     1's loader above its start spot, which keeps the home area loaded.
+--   * Run "m <lane> install" once, then reboot it (hold Ctrl+R).
+
+local args = { ... }
+local LANE = tonumber(args[1])
+local OPTION = args[2]
+local PROGRAM = shell and shell.getRunningProgram() or "quarry_turtle"
+if not LANE then
+  print("Usage: " .. PROGRAM .. " <laneId>   (lane 0..15)")
+  print("       " .. PROGRAM .. " <laneId> install   (run on every boot)")
+  return
+end
+
+if OPTION == "install" then
+  local f = fs.open("startup", "w")
+  f.write('shell.run("' .. PROGRAM .. '", "' .. LANE .. '")\n')
+  f.close()
+  print("Done: this turtle now runs '" .. PROGRAM .. " " .. LANE .. "' every time it boots.")
+  print("Reboot (hold Ctrl+R) to start it. To undo: delete startup")
+  return
+end
+
+-- Shown on the dashboard, so you can tell whether everything got updated.
+-- c, m and s carry the same number; it goes up with every change.
+local VERSION = "R0"
+
+-- Our program's checksum, so the main computer can spot a turtle running an
+-- old version between runs. Only when we were started by the boot loader
+-- (set up with "disk/join"), which fetches the new version when we reboot.
+local MY_VERSION
+if fs.exists("boot") and fs.exists(PROGRAM) then
+  local h = fs.open(PROGRAM, "r")
+  local text = h.readAll()
+  h.close()
+  local sum = 0
+  for i = 1, #text do sum = (sum * 31 + text:byte(i)) % 2147483647 end
+  MY_VERSION = sum
+end
+
+local STATE_FILES = { ".quarry_state_a", ".quarry_state_b" }
+if OPTION == "here" then
+  for _, name in ipairs(STATE_FILES) do fs.delete(name) end
+  fs.delete(".quarry_away") -- left over from older versions
+  fs.delete(".quarry_log_a")
+  fs.delete(".quarry_log_b")
+  print("Forgot the interrupted run. Starting fresh from this spot.")
+end
+
+local PROTOCOL = "chunkquarry"          -- control computer <-> miners
+local SERVICE_PROTOCOL = "chunkservice" -- miners <-> service turtle
+local STATUS_PROTOCOL = "chunkstatus"   -- status updates for the dashboard
+local DEPLOY_PROTOCOL = "chunkdeploy"   -- program updates from the main computer
+
+local function open_modem()
+  for _, side in ipairs(rs.getSides()) do
+    if peripheral.getType(side) == "modem" then
+      rednet.open(side)
+      return true
+    end
+  end
+  return false
+end
+
+if not open_modem() then
+  error("No modem attached! Attach a wireless modem and rerun.")
+end
+
+-- Network -------------------------------------------------------------------
+-- The server allows no more than ONE rednet message per second from each
+-- computer, so every message goes through net_send / net_broadcast: at
+-- most one per SEND_GAP seconds. We only broadcast until we know who to
+-- talk to.
+-- A turtle throws away rednet messages that arrive while it is moving or
+-- digging. So a listener runs beside the program (see the bottom of this
+-- file) and files every message in the inbox: nothing is lost, and nothing
+-- has to be repeated "just in case".
+local SEND_GAP = 1
+local last_send = os.clock() -- (as if we had just sent: a message may have gone out just before a reboot)
+local inbox = {}
+local controller_id -- the control computer, once it has answered us
+local service_id    -- the service turtle, once it has answered us
+local S -- our saved notes (see Run state below)
+
+local function listener()
+  while true do
+    local ev = { os.pullEvent("rednet_message") }
+    if ev[4] == PROTOCOL and type(ev[3]) == "table" and ev[3].cmd == "upload_log" then
+      os.queueEvent("upload_log") -- (see uploader)
+    elseif ev[4] == PROTOCOL or ev[4] == SERVICE_PROTOCOL or ev[4] == DEPLOY_PROTOCOL then
+      table.insert(inbox, ev)
+      if #inbox > 50 then table.remove(inbox, 1) end
+    end
+  end
+end
+
+-- (no yield between the last check and last_send: two senders can't both pass)
+local function wait_send_gap()
+  while os.clock() < last_send + SEND_GAP do
+    sleep(last_send + SEND_GAP - os.clock())
+  end
+  last_send = os.clock()
+end
+
+local function net_send(id, msg, proto)
+  wait_send_gap()
+  rednet.send(id, msg, proto)
+end
+
+local function net_broadcast(msg, proto)
+  wait_send_gap()
+  rednet.broadcast(msg, proto)
+end
+
+local function take(proto)
+  for i, ev in ipairs(inbox) do
+    if proto == nil or ev[4] == proto then
+      table.remove(inbox, i)
+      return ev
+    end
+  end
+end
+
+-- Like rednet.receive(proto, timeout) (no timeout = wait as long as it
+-- takes), but reads the inbox.
+local function net_receive(proto, timeout)
+  local ev = take(proto)
+  if ev then return ev[2], ev[3], ev[4] end
+  if timeout and timeout <= 0 then return nil end
+  local timer = timeout and os.startTimer(timeout)
+  while true do
+    local e = { os.pullEvent() }
+    if e[1] == "rednet_message" then
+      ev = take(proto) -- (the listener, running first, has filed it)
+      if ev then return ev[2], ev[3], ev[4] end
+    elseif timer and e[1] == "timer" and e[2] == timer then
+      return nil
+    end
+  end
+end
+
+-- Dashboard status ------------------------------------------------------------
+-- Every computer in the quarry has its own second in a CYCLE-second round,
+-- timed by the in-game clock (the same on every computer): lane N sends in
+-- second N+2, the service turtle in second 0. So the dashboard updates of
+-- the whole quarry arrive one at a time, never together. Everything else we
+-- have to tell the control computer (hello, chunk done, may I collect the
+-- loaders) rides along in the same message. We only send when something
+-- changed (plus a sign of life now and then during a run), and say nothing
+-- at all between runs. Only "updating" goes out at once (we reboot next).
+-- The service turtle's calls (request / ack / serviced) don't wait for a
+-- slot: miners stand idle until they're done.
+local CYCLE = 20
+local MY_SLOT = 2 + LANE % 18
+local KEEPALIVE = 240
+local URGENT = { ["updating"] = true }
+local status_pending
+local last_status = -math.huge
+
+local function world_seconds()
+  return (os.day() * 24 + os.time()) * 50 -- (an in-game hour is 50 s)
+end
+
+local function send_status()
+  local p = status_pending or { texts = {} }
+  status_pending = nil
+  last_status = os.clock()
+  local msg = { cmd = "status", id = LANE, state = p.state, texts = p.texts, ver = VERSION,
+    hello = p.hello, chunk_done = p.chunk_done, may_collect = p.may_collect }
+  if S then
+    msg.info = { chunk = S.chunk, pass = S.pass, y = S.y, fuel = turtle.getFuelLevel(),
+      depth = S.depth, trash = S.trash and true or false }
+  end
+  local to = controller_id or (S and S.controller)
+  if to then
+    net_send(to, msg, STATUS_PROTOCOL)
+  else
+    net_broadcast(msg, STATUS_PROTOCOL)
+  end
+end
+
+-- Runs beside the program: wakes up once a round, in our own second.
+local function status_sender()
+  local last_w
+  while true do
+    -- between runs with nothing to say: sleep until there is something
+    while not status_pending and not S do os.pullEvent("status_pending") end    local w = world_seconds()
+    local wait
+    if w == last_w then
+      -- the clock stands still (daylight cycle off): our own timing,
+      -- still one slot each (computers booted together have similar clocks)
+      wait = (MY_SLOT - os.clock()) % CYCLE
+    else
+      wait = (MY_SLOT - w) % CYCLE
+    end
+    if wait < 0.5 then wait = wait + CYCLE end -- (just sent in this slot)
+    last_w = w
+    sleep(wait)
+    if status_pending or (S and os.clock() - last_status >= KEEPALIVE) then
+      send_status()
+    end
+  end
+end
+
+-- force: send right away (only for things the control computer acts on)
+local function flush_status(force)
+  if force then send_status() end
+end
+
+-- Our own log, for finding out what went wrong: everything we report plus
+-- details the dashboard doesn't show. .quarry_debug_a is the current file,
+-- .quarry_debug_b the one before (a new one at every boot and every 300 lines).
+-- To look at it:  edit .quarry_debug_a      To share it:  pastebin put .quarry_debug_a
+local DEBUG_FILES = { ".quarry_debug_a", ".quarry_debug_b" }
+local debug_lines = 0
+local function rotate_debug()
+  if fs.exists(DEBUG_FILES[1]) then
+    if fs.exists(DEBUG_FILES[2]) then fs.delete(DEBUG_FILES[2]) end
+    fs.move(DEBUG_FILES[1], DEBUG_FILES[2])
+  end
+  debug_lines = 0
+end
+rotate_debug()
+
+local function debug(text)
+  if debug_lines >= 300 then rotate_debug() end
+  local where = S and string.format("c%s p%s y%s z%s f%s", tostring(S.chunk), tostring(S.pass),
+    tostring(S.y), tostring(S.z), tostring(turtle.getFuelLevel())) or "idle"
+  local line = string.format("%d %s %s %s", os.day(), textutils.formatTime(os.time(), true), where, text)
+  local h = fs.open(DEBUG_FILES[1], "a")
+  if h then
+    h.writeLine(line)
+    h.close()
+    debug_lines = debug_lines + 1
+  end
+end
+
+-- Prints a message and passes it (plus an optional short status) on to the
+-- control computer's dashboard.
+local function say(text, state)
+  if text then print(text) end
+  if text or (state and not (status_pending and status_pending.state == state)) then
+    debug((state and ("[" .. state .. "] ") or "") .. (text or ""))
+  end
+  status_pending = status_pending or { texts = {} }
+  if state then status_pending.state = state end
+  if text then table.insert(status_pending.texts, text) end
+  os.queueEvent("status_pending") -- (wakes status_sender if it's asleep)
+  if state and URGENT[state] then send_status() end
+end
+
+-- Something for the control computer, sent with our next status.
+local function tell(key, value)
+  status_pending = status_pending or { texts = {} }
+  status_pending[key] = value
+  os.queueEvent("status_pending")
+end
+
+
+-- Config --------------------------------------------------------------------
+local LOADER_SLOT = 16
+local FUEL_BUFFER = 20
+local UNBREAKABLE_TRIES = 5 -- failed digs in a row before we call it bedrock
+-- Go home to be serviced once fewer than this many cargo slots are free.
+-- One step digs at most 3 blocks (ahead, above, below), so with 3 free
+-- slots a new kind of ore always has somewhere to go.
+local MIN_FREE_SLOTS = 3
+-- After throwing out junk we want at least this many free, or we unload
+-- right away: when the slots are full of different ores, emptying the
+-- junk frees only a slot or so, and we'd be back at the trash can every
+-- few blocks.
+local FREE_AFTER_DUMP = MIN_FREE_SLOTS + 2
+local SAMPLE_SLOTS = { 12, 13, 14 } -- one each of the junk to throw away
+local TRASH_SLOT = 15       -- Extra Utilities Trash Can
+local LAST_FRONT_SLOT = 11  -- with a trash can, cargo the service turtle takes is in 1..11
+
+-- Run state -------------------------------------------------------------------
+-- S holds everything needed to carry on after a restart, including our
+-- position (y = 0 at the start, negative below; z = blocks forward from the
+-- start). It's nil when no run is in progress. It's saved to two files in
+-- turn, so a restart in the middle of writing one never loses both.
+-- (S is declared with the network code above.)
+local save_seq = 0
+
+-- SERVER CRASHES: a crash puts the world back to its last autosave (up to
+-- ~45 s ago), but our files keep their newer contents, so our notes end up
+-- ahead of where we really are. So every save is also logged, and after a
+-- restart our fuel level (1 per move) tells which logged moment the world
+-- went back to. Two files in turn, JOURNAL_MAX lines each: the older one
+-- always holds the previous JOURNAL_MAX saves (several minutes of work).
+local JOURNAL_FILES = { ".quarry_log_a", ".quarry_log_b" }
+local JOURNAL_MAX = 300
+local POS_FIELDS = { "seq", "y", "z", "pending", "fuel", "wt" }
+local journal_file, journal_lines, journal_core
+
+local function journal()
+  if type(S.fuel) ~= "number" then return end
+  if not journal_file or journal_lines >= JOURNAL_MAX then
+    journal_file = (journal_file == JOURNAL_FILES[1]) and JOURNAL_FILES[2] or JOURNAL_FILES[1]
+    local h = fs.open(journal_file, "w")
+    h.close()
+    journal_lines, journal_core = 0, nil -- each file starts with a full copy
+  end
+  -- a full copy when anything but our position changed, else just that
+  local keep = {}
+  for _, k in ipairs(POS_FIELDS) do keep[k] = S[k]; S[k] = nil end
+  local core = textutils.serialize(S)
+  for _, k in ipairs(POS_FIELDS) do S[k] = keep[k] end
+  local line
+  if core ~= journal_core then
+    journal_core = core
+    line = "S " .. textutils.serialize(S):gsub("\n", " ")
+  else
+    line = "P " .. S.seq .. " " .. S.y .. " " .. S.z .. " " .. (S.pending or "-") .. " " .. S.fuel
+      .. " " .. (S.wt or -1)
+  end
+  local h = fs.open(journal_file, "a")
+  h.writeLine(line)
+  h.close()
+  journal_lines = journal_lines + 1
+end
+
+local function clear_journal()
+  for _, name in ipairs(JOURNAL_FILES) do fs.delete(name) end
+  journal_file = nil
+end
+
+-- Every logged state, oldest first.
+local function read_journal()
+  local states = {}
+  for _, name in ipairs(JOURNAL_FILES) do
+    if fs.exists(name) then
+      local h = fs.open(name, "r")
+      local cur
+      while true do
+        local line = h.readLine()
+        if not line then break end
+        local kind, rest = line:sub(1, 1), line:sub(3)
+        if kind == "S" then
+          local ok, t = pcall(textutils.unserialize, rest)
+          if ok and type(t) == "table" and type(t.seq) == "number" then
+            cur = t
+            table.insert(states, t)
+          end
+        elseif kind == "P" and cur then
+          local seq, y, z, pend, fuel, wt = rest:match("^(%-?%d+) (%-?%d+) (%-?%d+) (%S+) (%-?%d+) ?(%-?%d*)$")
+          if seq then
+            local t = {}
+            for k, v in pairs(cur) do t[k] = v end
+            t.seq, t.y, t.z, t.fuel = tonumber(seq), tonumber(y), tonumber(z), tonumber(fuel)
+            t.wt = tonumber(wt)
+            t.pending = (pend ~= "-") and pend or nil
+            cur = t
+            table.insert(states, t)
+          end
+        end
+      end
+      h.close()
+    end
+  end
+  table.sort(states, function(a, b) return a.seq < b.seq end)
+  return states
+end
+
+local function save()
+  save_seq = save_seq + 1
+  S.seq = save_seq
+  S.fuel = turtle.getFuelLevel()
+  -- the in-game clock: saved with the world, so after a server crash it's
+  -- behind this (see start_run)
+  S.wt = math.floor(world_seconds())
+  local f = fs.open(STATE_FILES[save_seq % 2 + 1], "w")
+  f.write(textutils.serialize(S))
+  f.close()
+  journal()
+end
+
+local function load_state()
+  local best
+  for _, name in ipairs(STATE_FILES) do
+    if fs.exists(name) then
+      local f = fs.open(name, "r")
+      local text = f.readAll()
+      f.close()
+      local ok, t = pcall(textutils.unserialize, text)
+      if ok and type(t) == "table" and type(t.seq) == "number"
+          and (not best or t.seq > best.seq) then
+        best = t
+      end
+    end
+  end
+  return best
+end
+
+-- (the log is kept: after a crash we may not really be home yet; it's
+-- cleared when the next run starts)
+local function clear_state()
+  -- the log's last entry must match us now (no move still marked as
+  -- pending, today's fuel), or the next check takes it for a crash
+  save()
+  for _, name in ipairs(STATE_FILES) do fs.delete(name) end
+  S = nil
+end
+
+-- unique per program run, so the service turtle can tell a restart apart
+local session = os.getComputerID() .. ":" .. os.day() .. ":" .. os.time()
+local service_seq = 0
+
+-- Samples in 12-14 for this run? They stay put for the whole run, even
+-- if the trash can gets lost (older saves only have S.trash).
+local function has_samples()
+  return S ~= nil and (S.samples or S.trash) and true or false
+end
+
+local function is_cargo(slot)
+  if has_samples() and slot >= SAMPLE_SLOTS[1] and slot <= SAMPLE_SLOTS[#SAMPLE_SLOTS] then
+    return false
+  end
+  if S and S.trash and slot == TRASH_SLOT then return false end
+  return not (LANE == 0 and slot == LOADER_SLOT and (not S or S.loaders > 0))
+end
+
+local function fuel_level()
+  local level = turtle.getFuelLevel()
+  if level == "unlimited" then return math.huge end
+  return level
+end
+
+-- Movement ------------------------------------------------------------------
+-- We never turn: forward, back, up and down only. Every move is saved
+-- BEFORE it happens, together with the fuel level; after a restart, fuel
+-- one lower means the move happened, unchanged means it didn't.
+local DELTA = { f = { 0, 1 }, b = { 0, -1 }, u = { 1, 0 }, d = { -1, 0 } }
+
+local function apply_move(dir)
+  S.y = S.y + DELTA[dir][1]
+  S.z = S.z + DELTA[dir][2]
+end
+
+local function try_move(dir, move)
+  S.pending = dir
+  save()
+  local ok = move()
+  S.pending = nil
+  if ok then apply_move(dir) end
+  return ok
+end
+
+-- Turtles never attack: CC 1.63 can't tell a mob from a player, so when a
+-- non-block is in the way (mob, player, falling sand) we just wait for it
+-- to move.
+local function wait_for_entity(warned, waits)
+  if not warned then say("Something is in my way. Waiting for it to move...", "blocked") end
+  -- longer and longer (every try writes our notes to disk), up to 10 s
+  sleep(math.min(1 + (waits or 0), 10))
+  return true
+end
+
+-- Moves, digging whatever is in the way. Only used where no other turtle
+-- can ever be: ahead of us in our own lane, or straight up/down.
+local burn_fuel -- (defined with the inventory code below)
+
+-- Out of fuel: burn any fuel we carry; if there's none, wait right here
+-- until someone puts some in us (down in the tunnel the service turtle
+-- can't reach us). Never give up: a failed move would be taken for bedrock.
+local function wait_for_fuel()
+  local warned = false
+  while turtle.getFuelLevel() == 0 do
+    burn_fuel()
+    if turtle.getFuelLevel() == 0 then
+      if not warned then
+        say("Out of fuel! Put fuel (e.g. coal blocks) in any of my slots 1-11.",
+          "OUT OF FUEL - refuel by hand")
+        warned = true
+      end
+      flush_status()
+      sleep(10)
+    end
+  end
+  if warned then say("Got fuel, carrying on.", "working") end
+end
+
+local function dig_move(dir, move, dig, detect)
+  local failed_digs, digs, warned, waits = 0, 0, false, 0
+  while true do
+    if try_move(dir, move) then
+      if warned then say("Way is clear again.", "working") end
+      return true
+    end
+    if turtle.getFuelLevel() == 0 then
+      wait_for_fuel()
+    end
+    if detect() then
+      if dig() then
+        failed_digs = 0
+        digs = digs + 1
+        if digs > 50 then -- endless gravel? give up
+          debug("Gave up moving " .. dir .. ": dug 50 times and still blocked")
+          return false
+        end
+      else
+        failed_digs = failed_digs + 1
+        if failed_digs >= UNBREAKABLE_TRIES then
+          debug("Can't dig " .. dir .. " (" .. UNBREAKABLE_TRIES .. " tries): taking it as bedrock")
+          return false, "bedrock"
+        end
+      end
+    else
+      warned = wait_for_entity(warned, waits)
+      waits = waits + 1
+    end
+    sleep(0.3)
+  end
+end
+
+-- Backs up WITHOUT digging (a turtle can't dig behind itself). Every row we
+-- back along is already mined, so the only thing that can be in the way is
+-- a mob, a player or the service turtle: wait for it to move.
+local function back()
+  local warned = false
+  while not try_move("b", turtle.back) do
+    if turtle.getFuelLevel() == 0 then
+      wait_for_fuel()
+    end
+    if not warned then
+      say("Something is behind me. Waiting for it to move...", "blocked")
+      warned = true
+    end
+    sleep(1)
+  end
+  if warned then say("Way is clear again.", "working") end
+  return true
+end
+
+local function forward() return dig_move("f", turtle.forward, turtle.dig, turtle.detect) end
+local function up() return dig_move("u", turtle.up, turtle.digUp, turtle.detectUp) end
+local function down() return dig_move("d", turtle.down, turtle.digDown, turtle.detectDown) end
+
+local function go_to_y(target)
+  while S.y < target do if not up() then return false end end
+  while S.y > target do if not down() then return false end end
+  return true
+end
+
+local function go_to_z(target)
+  while S.z < target do if not forward() then return false end end
+  while S.z > target do if not back() then return false end end
+  return true
+end
+
+-- Digs the blocks above and below, staying inside the quarry (y 0..bottom).
+local function clear_above_below(bottom)
+  if S.y + 1 <= 0 then
+    while turtle.detectUp() do
+      if not turtle.digUp() then break end
+      sleep(0.3) -- let falling gravel/sand land
+    end
+  end
+  if S.y - 1 >= bottom and turtle.detectDown() then
+    turtle.digDown()
+  end
+end
+
+-- Inventory -----------------------------------------------------------------
+local function used_cargo_slots()
+  local n = 0
+  for i = 1, 16 do
+    if is_cargo(i) and turtle.getItemCount(i) > 0 then n = n + 1 end
+  end
+  return n
+end
+
+local function has_cargo() return used_cargo_slots() > 0 end
+
+-- How many stacks the service turtle should pull. It takes from our first
+-- non-empty slot each time, so with samples in 12-14 it may only take
+-- cargo from slots 1..11 (slot 16 is moved down afterwards).
+local function stacks_for_service()
+  local last = has_samples() and LAST_FRONT_SLOT or 16
+  local n = 0
+  for i = 1, last do
+    if is_cargo(i) and turtle.getItemCount(i) > 0 then n = n + 1 end
+  end
+  return n
+end
+
+-- Cargo that ended up past the samples (slot 16, or 15 if the trash can
+-- was lost) moves down into 1..11, where the service turtle can reach it.
+local function tidy_slot_16()
+  if not has_samples() then return end
+  for _, slot in ipairs({ TRASH_SLOT, 16 }) do
+    if is_cargo(slot) and turtle.getItemCount(slot) > 0 then
+      for i = 1, LAST_FRONT_SLOT do
+        if turtle.getItemCount(i) == 0 then
+          turtle.select(slot)
+          turtle.transferTo(i)
+          break
+        end
+      end
+    end
+  end
+  turtle.select(1)
+end
+
+-- (see MIN_FREE_SLOTS)
+local function free_cargo_slots()
+  local cargo_slots = 0
+  for i = 1, 16 do if is_cargo(i) then cargo_slots = cargo_slots + 1 end end
+  return cargo_slots - used_cargo_slots()
+end
+
+local function inventory_nearly_full()
+  return free_cargo_slots() < MIN_FREE_SLOTS
+end
+
+-- How much fuel we can hold (advanced turtles 100000, others 20000).
+local function fuel_limit()
+  local limit = turtle.getFuelLimit and turtle.getFuelLimit() or 20000
+  if type(limit) ~= "number" then return math.huge end
+  return limit
+end
+
+-- Burns fuel from our cargo (handed over, or coal we mined), but only as
+-- much as fits in the tank: the rest stays as cargo.
+function burn_fuel()
+  local marked = false
+  for i = 1, 16 do
+    -- room for any fuel item (a coal block is 800, lava 1000): burning one
+    -- into a nearly full tank would waste most of it
+    if fuel_limit() - fuel_level() < 1000 then break end
+    if is_cargo(i) and turtle.getItemCount(i) > 0 then
+      -- A restart in the middle of burning leaves our fuel above our
+      -- notes: this tells it apart from a server crash (see start_run).
+      -- We note how many items the slot held: the inventory goes back with
+      -- the world, so fewer items means we really burned them. Each slot
+      -- may hold a different fuel (coal 80, a coal block 800): the first
+      -- item is "any amount", the rest whole items of it.
+      S.burning = { slot = i, count = turtle.getItemCount(i) }
+      save()
+      marked = true
+      turtle.select(i)
+      local before = fuel_level()
+      if turtle.refuel(1) then -- fails for anything that isn't fuel
+        local per_item = fuel_level() - before
+        if per_item > 0 then
+          S.per_item = per_item
+          S.burning = { slot = i, count = turtle.getItemCount(i), per = per_item }
+          save()
+          local fit = math.floor((fuel_limit() - fuel_level()) / per_item)
+          local n = math.min(fit, turtle.getItemCount(i))
+          if n > 0 then turtle.refuel(n) end
+        end
+      end
+    end
+  end
+  turtle.select(1)
+  if not marked then return end
+  S.burning = nil
+  save() -- fuel changed: the saved fuel level must match again
+end
+
+-- Digs up one of our own things (trash can, loader) and puts it back in
+-- `slot`. CC doesn't always put what we dig into the selected slot, so we
+-- look for the slot that gained an item and move it over.
+local function dig_and_keep(slot, dig)
+  local before = {}
+  for i = 1, 16 do before[i] = turtle.getItemCount(i) end
+  turtle.select(slot)
+  local ok = dig()
+  if ok and turtle.getItemCount(slot) == before[slot] then
+    for i = 1, 16 do
+      local gained = turtle.getItemCount(i) - before[i]
+      if i ~= slot and gained > 0 then
+        turtle.select(i)
+        turtle.transferTo(slot, gained)
+        break
+      end
+    end
+  end
+  turtle.select(1)
+  return ok
+end
+
+-- Trash can -------------------------------------------------------------------
+local DIRS = {
+  u = { place = turtle.placeUp, drop = turtle.dropUp, dig = turtle.digUp, detect = turtle.detectUp },
+  d = { place = turtle.placeDown, drop = turtle.dropDown, dig = turtle.digDown, detect = turtle.detectDown },
+}
+
+-- Digs the trash can back up. Also used after a restart: S.trash_out says
+-- it may still be out there.
+local function pick_up_trash()
+  local d = DIRS[S.trash_out]
+  if turtle.getItemCount(TRASH_SLOT) == 0 and not S.trash_free then
+    -- note which slots are empty: the trash can lands in one of them
+    S.trash_free = {}
+    for i = 1, 16 do
+      if turtle.getItemCount(i) == 0 then table.insert(S.trash_free, i) end
+    end
+    save()
+  end
+  if turtle.getItemCount(TRASH_SLOT) == 0 and d.detect() then
+    dig_and_keep(TRASH_SLOT, d.dig)
+  end
+  -- After a restart between digging and moving it: find it (a single item
+  -- in a slot that was empty) and move it back.
+  if turtle.getItemCount(TRASH_SLOT) == 0 and S.trash_free then
+    for _, i in ipairs(S.trash_free) do
+      if i ~= TRASH_SLOT and turtle.getItemCount(i) == 1 then
+        turtle.select(i)
+        turtle.transferTo(TRASH_SLOT)
+        break
+      end
+    end
+  end
+  turtle.select(1)
+  if turtle.getItemCount(TRASH_SLOT) == 0 then
+    say("Couldn't pick my trash can back up! Keeping everything from now on (samples stay put).",
+      "TRASH CAN LOST")
+    S.trash = false
+  end
+  S.trash_out = nil
+  S.trash_free = nil
+  save()
+end
+
+local function is_junk(slot)
+  turtle.select(slot)
+  for _, s in ipairs(SAMPLE_SLOTS) do
+    if turtle.compareTo(s) then return true end
+  end
+  return false
+end
+
+-- Throws away everything that matches a sample (keeping one of each).
+-- The trash can goes in the mined-out space above us (below when we're on
+-- the top layer), and comes straight back.
+local function dump_junk()
+  if not S.trash then return end
+  local junk = {}
+  for i = 1, 16 do
+    if is_cargo(i) and turtle.getItemCount(i) > 0 and is_junk(i) then
+      table.insert(junk, i)
+    end
+  end
+  local extra = 0
+  for _, s in ipairs(SAMPLE_SLOTS) do extra = extra + turtle.getItemCount(s) - 1 end
+  turtle.select(1)
+  if #junk == 0 and extra < 64 then return end
+
+  local dir = S.y <= -1 and "u" or "d"
+  local d = DIRS[dir]
+  if d.detect() then d.dig() end -- gravel may have fallen in
+  S.trash_out = dir
+  save()
+  turtle.select(TRASH_SLOT)
+  if not d.place() then
+    -- something in the way (a mob?): try again next time
+    turtle.select(1)
+    S.trash_out = nil
+    save()
+    return
+  end
+  say(nil, "throwing out junk")
+  for _, s in ipairs(SAMPLE_SLOTS) do
+    local n = turtle.getItemCount(s) - 1
+    if n > 0 then
+      turtle.select(s)
+      d.drop(n)
+    end
+  end
+  for _, i in ipairs(junk) do
+    turtle.select(i)
+    d.drop()
+  end
+  pick_up_trash()
+  say(nil, "working")
+end
+
+-- One suck() by the service turtle takes the first item it finds AND the
+-- same item from every other slot (up to 64), samples and loaders
+-- included. So before it pulls "N stacks": junk goes in the trash, cargo
+-- that matches a slot we keep moves into that slot, and equal items are
+-- merged. Then each pull empties exactly one of our cargo slots.
+local function compact_cargo()
+  dump_junk()
+  local keep = {}
+  for i = 1, 16 do
+    if not is_cargo(i) and turtle.getItemCount(i) > 0 then table.insert(keep, i) end
+  end
+  for i = 1, 16 do
+    if is_cargo(i) and turtle.getItemCount(i) > 0 then
+      turtle.select(i)
+      for _, k in ipairs(keep) do
+        if k ~= TRASH_SLOT and turtle.getItemCount(i) > 0 and turtle.compareTo(k) then
+          turtle.transferTo(k)
+        end
+      end
+      for j = i + 1, 16 do
+        if turtle.getItemCount(i) == 0 then break end
+        if is_cargo(j) and turtle.getItemCount(j) > 0 and turtle.getItemSpace(i) > 0 then
+          turtle.select(j)
+          if turtle.compareTo(i) then turtle.transferTo(i) end
+          turtle.select(i)
+        end
+      end
+    end
+  end
+  turtle.select(1)
+  tidy_slot_16() -- so the service turtle can reach it (it takes slots 1-11)
+end
+
+-- Service turtle ------------------------------------------------------------
+-- Drives home to our start spot and waits there while the service turtle
+-- (on the home row right behind us) pulls out our blocks and hands us
+-- fuel, then returns to where we were.
+local check_in -- (defined with the control computer code below)
+local place_first_loader -- (defined with the chunk loader code below)
+
+-- Lane 0 at home: is chunk 1's loader still above us? A server crash can
+-- undo placing it without our fuel (or, with the daylight cycle off, the
+-- clock) telling us. Put it back if it's gone.
+local function check_first_loader()
+  if LANE ~= 0 or not S.first_loader_done or S.y ~= 0 or S.z ~= 0 then return end
+  if turtle.getItemCount(LOADER_SLOT) == 0 or S.loaders == 0 then return end
+  turtle.select(LOADER_SLOT)
+  local there = turtle.compareUp()
+  turtle.select(1)
+  if not there then
+    say("Chunk 1's loader was gone (server crash?): putting it back.")
+    place_first_loader()
+    save()
+  end
+end
+
+-- `label` is the dashboard status while waiting (repeated now and then:
+-- the control computer may have missed it). If STOP was pressed while we
+-- were home, we stay home: S.stopped is set and the caller winds down.
+local function request_service(label, why)
+  label = label or "waiting for service"
+  if why then say("Heading home: " .. why .. ".") end
+  local rz, ry = S.z, S.y
+  -- Straight up first: the column above any spot we've visited is already
+  -- mined, and so is the whole y=0 row back home.
+  while not (S.y == 0 and S.z == 0) do
+    go_to_y(0)
+    go_to_z(0)
+    if not (S.y == 0 and S.z == 0) then sleep(5) end
+  end
+
+  -- enough to get back to work, work a row, and come home again
+  local need = 2 * (math.abs(ry) + rz) + S.length + FUEL_BUFFER
+  while true do
+  check_first_loader()
+  compact_cargo() -- (also: no point carrying junk to the service turtle)
+  service_seq = service_seq + 1
+  local req = {
+    cmd = "service_request", id = LANE,
+    session = session, seq = service_seq, z = 0,
+    fuel = turtle.getFuelLevel(), limit = fuel_limit(), stacks = stacks_for_service(),
+  }
+  print("Waiting for service turtle...")
+  say(nil, label)
+
+  local acked = false
+  local last_sent = -math.huge
+  while true do
+    -- re-send until acknowledged, then only now and then in case the
+    -- service turtle was restarted (it forgets its queue)
+    local interval = acked and 60 or 30
+    if last_sent + interval - os.clock() <= 0 then -- (same sum as the wait below)
+      req.controller = controller_id -- (so the service turtle can report straight to it)
+      -- count again: a service turtle restarted halfway through unloading
+      -- us has taken some already, and pulling the old count would reach
+      -- into the samples
+      req.stacks = stacks_for_service()
+      if service_id then
+        net_send(service_id, req, SERVICE_PROTOCOL)
+      else
+        net_broadcast(req, SERVICE_PROTOCOL)
+      end
+      if acked then say(nil, label) end
+      last_sent = os.clock()
+    end
+
+    -- (it pulls exactly req.stacks stacks: nothing changes here while we wait)
+    local sender, msg = net_receive(SERVICE_PROTOCOL, last_sent + interval - os.clock())
+    if type(msg) == "table" and msg.id == LANE
+        and msg.session == session and msg.seq == req.seq then
+      service_id = sender
+      if msg.cmd == "ack" then
+        acked = true
+      elseif msg.cmd == "serviced" then
+        break
+      end
+    end
+  end
+
+  burn_fuel()
+  tidy_slot_16()
+  print("Serviced. Fuel: " .. tostring(turtle.getFuelLevel()))
+  -- never drive back down on an empty "serviced": wait here and ask again
+  if fuel_level() >= need and not inventory_nearly_full() then break end
+  say("Still not enough fuel to get back to work: waiting at home.", "waiting for fuel")
+  sleep(10)
+  end -- while
+  -- STOP pressed? We're home already: don't drive back out to finish the strip
+  if not S.stopped and not check_in() then
+    S.stopped = true
+    save()
+  end
+  if S.stopped then say("Stopped: staying home.", "stopped, at home") end
+  if S.stopped then return end
+  say(nil, "back to work")
+  go_to_z(rz)
+  go_to_y(ry)
+end
+
+-- enough to finish this row and still get home
+local function fuel_needed()
+  return math.abs(S.y) + S.z + S.length + FUEL_BUFFER
+end
+
+local function ensure_ok()
+  flush_status()
+  local unload = false
+  if inventory_nearly_full() then
+    dump_junk()
+    burn_fuel() -- coal we mined: as much as fits in the tank, freeing slots
+    unload = free_cargo_slots() < FREE_AFTER_DUMP
+  elseif fuel_level() < fuel_needed() then
+    burn_fuel()
+  end
+  -- loop: one delivery might not be enough
+  while unload or fuel_level() < fuel_needed() or inventory_nearly_full() do
+    local why
+    if fuel_level() < fuel_needed() then
+      why = "fuel " .. fuel_level() .. " < " .. fuel_needed() .. " needed"
+    else
+      why = "unloading, " .. free_cargo_slots() .. " free slots"
+    end
+    unload = false
+    request_service(nil, why)
+    if S.stopped then return end
+  end
+end
+
+-- Makes sure we can travel `distance` more blocks along the surface.
+local function ensure_fuel_for(distance)
+  while fuel_level() < distance + FUEL_BUFFER do
+    request_service(nil, "fuel " .. fuel_level() .. " < " .. (distance + FUEL_BUFFER) .. " for the trip")
+  end
+end
+
+-- Control computer ----------------------------------------------------------
+-- Reports progress and asks whether to keep going. Only called while
+-- parked, so the reply isn't lost. Returns false if told to stop.
+function check_in()
+  say(nil, "mining pass " .. tostring(S.pass))
+  for i, ev in ipairs(inbox) do
+    local msg = ev[3]
+    if ev[4] == PROTOCOL and ev[2] == S.controller and type(msg) == "table"
+        and msg.cmd == "stop" then
+      table.remove(inbox, i)
+      debug("Got stop")
+      return false
+    end
+  end
+  return true
+end
+
+-- Reports the chunk finished and waits for "next_chunk" or "stop".
+local function wait_for_next_chunk()
+  -- (the answer comes when the slowest lane is done too: only re-send in
+  -- case the control computer was restarted in the meantime)
+  local last_sent = -math.huge
+  while true do
+    if last_sent + 60 - os.clock() <= 0 then -- (same sum as the wait below)
+      tell("chunk_done", { chunk = S.chunk, no_next_loader = S.no_next_loader })
+      last_sent = os.clock()
+    end
+    local sender, msg = net_receive(PROTOCOL, last_sent + 60 - os.clock())
+    if sender == S.controller and type(msg) == "table" then
+      if msg.cmd == "stop" then return false end
+      if msg.cmd == "next_chunk" and msg.chunk == S.chunk + 1 then return true end
+    end
+  end
+end
+
+-- Chunk loaders (lane 0) --------------------------------------------------------
+-- Placing is safe to repeat after a restart: a loader already in the spot
+-- (we were restarted right after placing it) is left there; anything else
+-- is dug out first.
+local function loaders_left()
+  if turtle.getItemCount(LOADER_SLOT) == 0 then S.loaders = 0 end
+  return S.loaders > 0
+end
+
+-- Chunk 1's loader goes right above the start spot, and stays there
+-- between runs: if it's already in place, keep it.
+function place_first_loader()
+  if turtle.getItemCount(LOADER_SLOT) > 0 then
+    turtle.select(LOADER_SLOT)
+    local already = turtle.compareUp()
+    turtle.select(1)
+    if already then
+      S.loader_top = math.max(S.loader_top or 0, 1)
+      return
+    end
+  end
+  if not loaders_left() then
+    say("WARNING: no Spot Loaders in slot 16!")
+    return
+  end
+  if turtle.detectUp() then turtle.digUp() end
+  turtle.select(LOADER_SLOT)
+  if turtle.placeUp() then
+    S.loaders = S.loaders - 1
+    S.loader_top = math.max(S.loader_top or 0, 1)
+  else
+    say("WARNING: couldn't place chunk loader.")
+  end
+  turtle.select(1)
+end
+
+-- Places the NEXT chunk's loader while still standing in the current
+-- (loaded) chunk, so the next chunk is loaded before anyone drives into it:
+-- at the far end of the lane, one block above the surface (no turtle ever
+-- travels up there), straight ahead -- the first block of the next chunk,
+-- directly above lane 0's next starting spot. Returns false if it couldn't,
+-- in which case the run has to end after this chunk.
+local function place_next_chunk_loader()
+  if not loaders_left() then
+    say("Out of Spot Loaders (slot 16)! Ending the run after this chunk.")
+    return false
+  end
+  if S.y < 1 then
+    go_to_z(S.z_base + S.length - 1)
+    if not up() then
+      say("Couldn't climb up to place the next loader. Ending the run.")
+      return false
+    end
+  end
+  turtle.select(LOADER_SLOT)
+  local placed = turtle.compare() -- already there?
+  if not placed then
+    turtle.select(1)
+    if turtle.detect() then turtle.dig() end
+    turtle.select(LOADER_SLOT)
+    placed = turtle.place()
+  end
+  turtle.select(1)
+  S.loaders = turtle.getItemCount(LOADER_SLOT)
+  if placed then
+    S.loader_top = S.chunk + 1 -- highest chunk with a loader in it
+  end
+  save()
+  go_to_y(0)
+  if placed then
+    say("Placed loader for chunk " .. (S.chunk + 1))
+  else
+    say("Couldn't place the next loader. Ending the run.")
+  end
+  return placed
+end
+
+-- At the end of a run lane 0 is the last one out and takes the loaders back
+-- (into slot 16) on its way home. First the control computer must confirm
+-- that every other lane and the service turtle are back: a chunk whose
+-- loader we take is unloaded, and a turtle still in it would be frozen.
+local function wait_to_collect()
+  say("Waiting for everyone else to get home, then picking up the loaders.",
+    "waiting to collect loaders")
+  local last_sent = -math.huge
+  while true do
+    if last_sent + 30 - os.clock() <= 0 then -- (same sum as the wait below)
+      tell("may_collect", true)
+      last_sent = os.clock()
+    end
+    local sender, msg = net_receive(PROTOCOL, last_sent + 30 - os.clock())
+    if sender == S.controller and type(msg) == "table"
+        and msg.cmd == "collect" and msg.id == LANE then
+      return
+    end
+  end
+end
+
+-- Backs out of the tunnel picking up each chunk's loader from the chunk
+-- before it (still loaded by its own loader): at the far end of that chunk,
+-- one up, dig forward -- the spot it was placed from. Safe to restart: a
+-- spot that's already empty is just skipped. Chunk 1's loader (above our
+-- start spot) stays, so the home chunk stays loaded between runs.
+local function collect_loaders()
+  if not S.collect_ok then
+    wait_to_collect()
+    S.collect_ok = true
+    save()
+    say("Picking up the chunk loaders.", "collecting loaders")
+  end
+  -- make room in slot 16 if blocks ended up there after the loaders ran out
+  if turtle.getItemCount(LOADER_SLOT) > 0 and S.loaders == 0 then
+    for i = 1, 15 do
+      if turtle.getItemCount(i) == 0 then
+        turtle.select(LOADER_SLOT)
+        turtle.transferTo(i)
+        break
+      end
+    end
+  end
+  while (S.loader_top or 0) >= 2 do
+    local j = S.loader_top
+    go_to_y(0)
+    go_to_z(S.length * (j - 1) - 1)
+    go_to_y(1)
+    if turtle.detect() then dig_and_keep(LOADER_SLOT, turtle.dig) end
+    S.loaders = turtle.getItemCount(LOADER_SLOT)
+    S.loader_top = j - 1
+    save()
+  end
+  go_to_y(0)
+end
+
+-- Mining --------------------------------------------------------------------
+-- Digs straight down from the chunk entrance until bedrock, and remembers
+-- how deep that is (bedrock is flat, so it's the same for every chunk).
+-- Every pass goes down this column anyway. Safe to restart: it just keeps
+-- going down from wherever we are.
+local function find_bedrock()
+  say("Digging down to find bedrock...", "finding bedrock")
+  go_to_z(S.z_base)
+  while true do
+    ensure_ok()
+    if S.stopped then return end
+    local ok, why = down()
+    if not ok and why == "bedrock" then break end
+    if not ok then sleep(1) end
+  end
+  -- we're on the lowest layer that can be mined
+  S.depth = 1 - S.y
+  save()
+  say("Bedrock is " .. (S.depth + 1) .. " blocks down.", "working")
+end
+
+local function passes_per_chunk() return math.ceil(S.depth / 3) end
+
+-- Pass p is centered on y = -1 - 3(p-1) and clears that layer plus the ones
+-- above and below it. The last one is raised so it stays inside the depth.
+local function pass_center(p)
+  return math.max(-1 - 3 * (p - 1), -(S.depth - 1))
+end
+
+-- One pass: down to the pass's layer at the chunk entrance, forward to the
+-- far end, then back to the entrance. Safe to restart from any point.
+-- Returns false if we hit something unbreakable (bedrock).
+local function do_pass(p)
+  local bottom = -(S.depth - 1)
+  local cy = pass_center(p)
+  local z_end = S.z_base + S.length - 1
+  if S.y ~= cy then
+    go_to_z(S.z_base) -- back along an already-mined layer
+    if not go_to_y(cy) then return false end
+  end
+  clear_above_below(bottom)
+  while S.z < z_end do
+    ensure_ok()
+    if S.stopped then return true end
+    if not forward() then return false end
+    clear_above_below(bottom)
+  end
+  go_to_z(S.z_base)
+  return true
+end
+
+-- Mines the rest of the current chunk. Returns false if told to stop.
+local function mine_chunk()
+  if not S.depth then find_bedrock() end
+  while not S.stopped and S.pass <= passes_per_chunk() do
+    if not check_in() then return false end
+    ensure_ok()
+    if S.stopped then break end
+    local ok = do_pass(S.pass)
+    if S.stopped then break end
+    if not ok then
+      say("Pass " .. S.pass .. " hit something I can't dig at y=" .. S.y .. ", z=" .. S.z
+        .. ": counting this chunk as done.")
+    end
+    S.pass = ok and S.pass + 1 or passes_per_chunk() + 1 -- bedrock: chunk done
+    save()
+  end
+  return not S.stopped
+end
+
+-- Main ----------------------------------------------------------------------
+-- The run is a series of phases, saved in S.phase, so after a restart we
+-- pick up in the right one:
+--   mining      mining passes S.pass.. of chunk S.chunk
+--   loader      lane 0 places the next chunk's loader
+--   chunk_end   hand over our blocks, report the chunk done, wait
+--   transit     drive along the surface to the next chunk's entrance
+--   going_home  back to the start spot at the end of the run
+local function run()
+  while true do
+    if S.phase == "mining" then
+      if LANE == 0 and not S.first_loader_done then
+        place_first_loader()
+        S.first_loader_done = true
+        save()
+      end
+      local keep_going = true
+      if S.chunk <= (S.skip or 0) then
+        -- mined in an earlier run: just pass through (lane 0 still places
+        -- the loaders, so every chunk we drive through is loaded)
+        say("Passing chunk " .. S.chunk .. " (mined in an earlier run).", "passing chunk " .. S.chunk)
+      else
+        keep_going = mine_chunk()
+      end
+      go_to_y(0)
+      S.stopped = not keep_going
+      local more_chunks = S.max_chunks == 0 or S.chunk < S.max_chunks
+      S.phase = (LANE == 0 and keep_going and more_chunks) and "loader" or "chunk_end"
+      save()
+
+    elseif S.phase == "loader" then
+      ensure_fuel_for(2 * S.length + 4)
+      if not S.stopped then S.no_next_loader = not place_next_chunk_loader() end
+      S.phase = "chunk_end"
+      save()
+
+    elseif S.phase == "chunk_end" then
+      -- (lane 0 waits at the far end, where it placed the next loader)
+      go_to_y(0)
+      if S.stopped or not wait_for_next_chunk() then
+        S.phase = "going_home"
+      else
+        ensure_fuel_for(S.length)
+        if S.stopped then
+          S.phase = "going_home"
+        else
+          S.chunk = S.chunk + 1
+          S.z_base = S.z_base + S.length
+          S.pass = 1
+          S.phase = "transit"
+        end
+      end
+      save()
+
+    elseif S.phase == "transit" then
+      -- keep trying rather than carrying on from the wrong spot
+      while not go_to_z(S.z_base) do
+        say("Can't reach the next chunk yet, retrying...", "stuck at chunk edge")
+        sleep(5)
+      end
+      S.phase = "mining"
+      save()
+
+    elseif S.phase == "going_home" then
+      say(nil, "going home") -- (the control computer stops re-sending "stop")
+      local collecting = LANE == 0 and (S.loader_top or 0) >= 2
+      if collecting then
+        -- may drive to the far end of this chunk, plus up/down per loader
+        ensure_fuel_for(S.z + S.length + 2 * S.loader_top + 2)
+        go_to_y(0)
+        collect_loaders()
+      else
+        ensure_fuel_for(S.z)
+      end
+      go_to_y(0)
+      go_to_z(0)
+      if S.y == 0 and S.z == 0 then
+        -- Out of the tunnel: lane 0 may take the loaders back now, while
+        -- we hand everything over before we call it a day.
+        say(nil, "home, unloading")
+        check_first_loader()
+        dump_junk()
+        if has_cargo() then request_service("home, unloading") end
+        clear_state()
+        say("Finished, back at the start.", "finished")
+      else
+        lost("Finished, but couldn't get all the way back to my start spot!")
+      end
+      return
+    end
+  end
+end
+
+-- Waits for the control computer's "start" and sets up a fresh run. This
+-- is also the only time we accept "reboot to update" from the main
+-- computer: never in the middle of a run.
+local function register_and_wait()
+  print("Lane " .. LANE .. ": waiting for the control computer...")
+  -- anything left over from the last run (a second "start", a re-sent
+  -- "stop") must not start or stop the next one
+  for i = #inbox, 1, -1 do
+    if inbox[i][4] == PROTOCOL then table.remove(inbox, i) end
+  end
+  -- (every 30 s until it answers: a hello lost out of radio range would
+  -- leave us "not home" and lane 0 waiting for us forever)
+  local registered = false
+  local said_hello = false
+  local last_hello = -math.huge
+  while true do
+    -- say hello until the control computer answers, then keep quiet (it
+    -- asks "who" when it needs to hear from us again)
+    if (not registered or not said_hello) and last_hello + 30 - os.clock() <= 0 then -- (same sum as the wait below)
+      said_hello = true
+      tell("hello", { version = MY_VERSION, registered = registered })
+      last_hello = os.clock()
+    end
+    local sender, msg, protocol = net_receive(nil, (not registered) and (last_hello + 30 - os.clock()) or nil)
+    if protocol == PROTOCOL and type(msg) == "table" and msg.cmd == "who" then
+      controller_id = sender
+      tell("hello", { version = MY_VERSION, registered = registered })
+    end
+    if protocol == DEPLOY_PROTOCOL and type(msg) == "table" and msg.cmd == "update_reboot" then
+      say("Rebooting to install an update.", "updating")
+      os.reboot()
+    end
+    if protocol == PROTOCOL and type(msg) == "table" and msg.id == LANE then
+      if msg.cmd == "registered" then
+        controller_id = sender
+        if not registered then print("Registered. Waiting for start...") end
+        registered = true
+      elseif msg.cmd == "start" then
+        controller_id = sender
+        -- a hello still waiting for our slot would look like "I missed
+        -- the start" and get us a second one
+        if status_pending then status_pending.hello = nil end
+        return sender, msg
+      end
+    end
+  end
+end
+
+-- Keeps telling the dashboard (the control computer may still be booting
+-- after a restart), until someone sorts us out by hand.
+local function lost(reason)
+  print("Put me back on my start spot, facing the tunnel, then run:")
+  print("  " .. PROGRAM .. " " .. LANE .. " here")
+  while true do
+    say(reason, "LOST - move to start")
+    sleep(60)
+  end
+end
+
+-- After a server crash: find the logged moment the world went back to
+-- (the one whose fuel matches ours now) and carry on from there. Work done
+-- since then is simply done again. Returns true if found.
+-- now_wt (the in-game clock now): skip saves made later than that.
+local function rewind(now_fuel, now_wt)
+  local states = read_journal()
+  for i = #states, 1, -1 do
+    local st = states[i]
+    local pick
+    local future = now_wt and st.wt and st.wt > now_wt + 3
+    if future then
+      -- (made after the moment the world went back to)
+    elseif st.fuel == now_fuel then
+      -- the earliest of the saves made at this fuel level (no move in
+      -- between): anything done after it is safe to do again
+      local j = i
+      while j > 1 and states[j - 1].fuel == now_fuel do j = j - 1 end
+      pick = states[j]
+      for k = j, i do -- a trash can that may be out there: fetch it
+        if states[k].trash_out then pick.trash_out = states[k].trash_out end
+        -- (and which slots were empty before digging it back up)
+        if states[k].trash_free then pick.trash_free = states[k].trash_free end
+      end
+      pick.pending = nil
+    elseif st.pending and st.fuel - 1 == now_fuel then
+      pick = st -- crashed just after this move
+    end
+    if pick then
+      local newest = states[#states].seq
+      S = pick
+      if S.pending then apply_move(S.pending) end
+      S.pending = nil
+      save_seq = newest
+      clear_journal() -- that future never happened: start a fresh log
+      say("Server crash: went back " .. (#states - i) .. " saves to match the world.",
+        "recovered after crash")
+      return true
+    end
+  end
+  return false
+end
+
+-- Restarted while burning, with more fuel than our notes: did the burn
+-- really happen (items gone from the slot, and the right amount of fuel
+-- for them)? If not, a server crash undid some moves.
+local function burn_explains(now_fuel)
+  local b = S.burning
+  if not b.slot then -- (notes from an older version)
+    return not b.per or (now_fuel - S.fuel) % b.per == 0
+  end
+  local used = (b.count or 0) - turtle.getItemCount(b.slot)
+  if b.per then return used >= 1 and now_fuel - S.fuel == used * b.per end
+  return used == 1
+end
+
+-- Starts a run: either resumes the one saved on disk (after a restart) or
+-- waits for the control computer to start a new one. Returns false if we
+-- can't carry on (LOST).
+local function start_run()
+  S = load_state()
+  if not S then
+    -- Our notes say the run is over. If our fuel doesn't match the log, a
+    -- server crash put us back in the tunnel before we got home: carry on.
+    local now_fuel = turtle.getFuelLevel()
+    local states = read_journal()
+    local last = states[#states]
+    local now_wt = math.floor(world_seconds())
+    if last and type(now_fuel) == "number"
+        and ((last.fuel ~= now_fuel and rewind(now_fuel))
+          or (last.wt and now_wt < last.wt - 3 and rewind(now_fuel, now_wt))) then
+      save()
+      if S.trash_out then pick_up_trash() end
+      S.collect_ok = nil -- (ask again for the loader go-ahead)
+      say("Restarted: resuming chunk " .. S.chunk .. " (" .. S.phase .. ").", "resuming")
+      return true
+    end
+    S = nil
+    local controller, msg = register_and_wait()
+    -- a "stop" re-sent after the last run ended mustn't stop this one
+    for i = #inbox, 1, -1 do
+      if inbox[i][4] == PROTOCOL then table.remove(inbox, i) end
+    end
+    clear_journal() -- a new run: the old log is no longer needed
+    -- samples in 12-14 and a trash can in 15: throw junk away
+    local trash = true
+    for i = SAMPLE_SLOTS[1], TRASH_SLOT do
+      if turtle.getItemCount(i) == 0 then trash = false end
+    end
+    if not trash then
+      say("No trash can (slot 15) or samples (slots 12-14): keeping everything.")
+    end
+    local chunk = msg.chunk or 1
+    S = {
+      -- depth: layers down to bedrock, found when we first dig down
+      controller = controller, length = msg.length, depth = nil, trash = trash, samples = trash,
+      max_chunks = msg.chunks or 0, chunk = chunk, skip = msg.skip or 0,
+      z_base = (chunk - 1) * msg.length, pass = 1, y = 0, z = 0,
+      loaders = (LANE == 0) and turtle.getItemCount(LOADER_SLOT) or 0,
+      -- joining a run already past chunk 1: that chunk's loader is placed
+      first_loader_done = chunk > 1,
+      loader_top = (chunk > 1) and chunk or nil,
+    }
+    S.phase = (S.z_base > 0) and "transit" or "mining"
+    save_seq = 0
+    save()
+    print("Started: " .. S.length .. " long, down to bedrock.")
+    return true
+  end
+
+  save_seq = S.seq
+  -- Do our notes match the world? Every move costs exactly 1 fuel. And the
+  -- in-game clock going back means a server crash for sure, even when our
+  -- fuel happens to match (say we burned a coal and made 80 moves since).
+  -- (If nothing in the log fits, someone set the time back: carry on.)
+  local now_fuel = turtle.getFuelLevel()
+  local now_wt = math.floor(world_seconds())
+  if type(S.wt) == "number" and now_wt < S.wt - 3 and type(now_fuel) == "number"
+      and rewind(now_fuel, now_wt) then
+    -- (rewind has put us back to the matching save)
+  elseif type(now_fuel) ~= "number" or type(S.fuel) ~= "number" then
+    if S.pending then
+      lost("Restarted mid-move with unlimited fuel, so I can't tell where I am.")
+    end
+  elseif S.pending and now_fuel == S.fuel - 1 then
+    apply_move(S.pending) -- the last move happened
+  elseif S.pending and S.fuel == 0 then
+    -- we had no fuel, so that move can't have happened (someone has given
+    -- us fuel by hand since)
+  elseif S.burning and now_fuel > S.fuel and burn_explains(now_fuel) then
+    -- restarted while burning fuel: our position is right
+    S.burning = nil
+  elseif now_fuel ~= S.fuel then
+    -- the world is behind our notes: a server crash
+    if not rewind(now_fuel) then
+      lost("Restarted and my fuel (" .. tostring(now_fuel) .. ") doesn't match my notes (" .. tostring(S.fuel) .. "), so I can't tell where I am.")
+    end
+  end
+  S.pending = nil
+  -- Our trash can isn't in slot 15? Using it costs no fuel, so a server
+  -- crash can undo part of that without our fuel telling us: if the log
+  -- shows it out since our last move, go and find it.
+  if S.trash and not S.trash_out and turtle.getItemCount(TRASH_SLOT) == 0
+      and type(now_fuel) == "number" then
+    local states = read_journal()
+    for i = #states, 1, -1 do
+      if states[i].fuel ~= now_fuel then break end
+      if states[i].trash_out then S.trash_out = states[i].trash_out end
+      if states[i].trash_free then S.trash_free = states[i].trash_free end
+    end
+  end
+  save()
+  if S.trash_out then pick_up_trash() end
+  -- the loader go-ahead may be stale (a crash can put the others back in
+  -- the tunnel): ask again
+  S.collect_ok = nil
+  say("Restarted: resuming chunk " .. S.chunk .. " (" .. S.phase .. ").", "resuming")
+  return true
+end
+
+-- Run after run: when one ends with us back on the start spot, wait for
+-- the next START. Stop only if we're LOST.
+-- Uploads text to a paste site (no account needed) and returns its web
+-- address, or nil and why not. (pastebin's old API no longer works.)
+local function upload(text)
+  if not http then return nil, "HTTP is turned off on this server" end
+  local r = http.post("https://paste.rs/", text)
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url end
+  end
+  r = http.post("https://dpaste.com/api/v2/",
+    "expiry_days=30&content=" .. textutils.urlEncode(text))
+  if r then
+    local url = (r.readAll() or ""):match("https?://%S+")
+    r.close()
+    if url then return url .. ".txt" end
+  end
+  return nil, "paste.rs and dpaste.com both refused (blocked by the server?)"
+end
+-- Runs beside the program: when the main computer asks (L key), uploads
+-- our log files (older one first) and reports the web address.
+local function uploader()
+  while true do
+    os.pullEvent("upload_log")
+    local text = ""
+    for i = 2, 1, -1 do
+      if fs.exists(DEBUG_FILES[i]) then
+        local h = fs.open(DEBUG_FILES[i], "r")
+        text = text .. "== " .. DEBUG_FILES[i] .. "\n" .. (h.readAll() or "") .. "\n"
+        h.close()
+      end
+    end
+    local url, why = upload(text)
+    if url then
+      say("Log uploaded: " .. url)
+    else
+      say("Couldn't upload my log: " .. tostring(why))
+    end
+  end
+end
+
+local function main()
+  while start_run() do
+    run()
+    if S then return end -- ended away from the start spot: LOST
+  end
+end
+-- (the listener goes first, so a message is filed before main looks)
+parallel.waitForAny(listener, main, status_sender, uploader)

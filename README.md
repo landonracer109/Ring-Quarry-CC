@@ -194,3 +194,9 @@ Dashboard buttons (bottom row of the monitor), or keys on the main computer:
 
 Turtles get their programs from the main computer, so only the main
 computer ever downloads from GitHub.
+
+## Simulator
+
+Every change is tested first in a ComputerCraft 1.63 simulator that runs
+these exact programs in a fake world, with restarts and server crashes.
+It lives in [`sim/`](sim/); see [sim/README.md](sim/README.md).

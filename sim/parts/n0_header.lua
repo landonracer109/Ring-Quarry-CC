@@ -1,0 +1,32 @@
+-- quarry_turtle (mining turtle, RING quarry) -- ComputerCraft 1.63
+-- Usage: m <laneId>            run as lane <laneId> (0..15)
+--        m <laneId> install    also run automatically every time it boots
+--        m <laneId> here       forget an interrupted run ("I'm on my start
+--                              spot") -- only needed if it says it's LOST
+--
+-- 16 of these mine one chunk at a time together, each its own 1-wide lane,
+-- 3 layers per pass, all the way down to bedrock. The chunks go in rings
+-- around the control chunk (main computer tower, service turtle),
+-- clockwise, starting with the spoke: the chunks straight north of it.
+-- Lanes run the way the fleet goes round (north, east, south or west);
+-- at a corner the fleet turns. Between chunks, and home for service, a
+-- turtle only travels through mined-out chunks, each lane at its own depth
+-- so they never meet. Before mining a chunk every lane checks whether its
+-- lane is already mined (the bottom layer is always done last).
+-- Junk (whatever is in the sample slots: cobble, dirt, gravel) goes into
+-- a Trash Can it carries. When it's still nearly full, or low on fuel even
+-- after burning the coal it mined, it goes home to its start spot, where
+-- the service turtle unloads and refuels it.
+--
+-- AFTER A RESTART: it saves its position before every move and turn; with
+-- GPS hosts on the tower it also asks GPS where it is.
+--
+-- SETUP (per turtle):
+--   * 16 miners in a flush row at the south edge of the chunk north of the
+--     control chunk, all facing north. Lane 0 is the LEFTMOST.
+--   * Wireless modem on every turtle.
+--   * Slots 12, 13, 14: ONE cobblestone, ONE dirt, ONE gravel (samples of
+--     what to throw away). Slot 15: an Extra Utilities Trash Can.
+--   * Lane 0 only: a stack of Spot Loaders in slot 16 (from ring 2 on
+--     every chunk gets one while it's mined; they all come back).
+--   * Run "m <lane> install" once, then reboot it (hold Ctrl+R).
